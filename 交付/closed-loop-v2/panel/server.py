@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 import run_mission  # noqa: E402
-from loopcore.envelope import Envelope, MessageKind  # noqa: E402
+from loopcore.envelope import MessageKind  # noqa: E402
 from loopcore.mission import MISSION_TERMINAL  # noqa: E402
 from loopcore.event_normalizer import now_iso  # noqa: E402
 
@@ -111,9 +111,24 @@ class PanelState:
 
     def stop(self):
         self.stop_flag.set()
+        # Land the mission in HUMAN right away (the terminal transition reaps
+        # every bound worker) so the user-visible state stops progressing NOW
+        # instead of after the in-flight tick unwinds. Controller internals
+        # are store-locked/idempotent; runs outside self.lock so a slow AO
+        # kill can never freeze the panel API.
+        rt = self.rt
+        if rt is not None:
+            try:
+                rt.controller.request_stop()
+            except Exception as e:                       # never die mute
+                self.errors.append("%s: stop: %s" % (now_iso(), e))
 
     def running(self) -> bool:
-        return bool(self.thread and self.thread.is_alive())
+        # Once a stop is requested the mission does no further work (stop
+        # checkpoints + absorbing terminal state); report stopped immediately
+        # rather than wait for an in-flight agent call to unwind.
+        return bool(self.thread and self.thread.is_alive()
+                    and not self.stop_flag.is_set())
 
     # ---- directive channel
     def post_directive(self, target: str, text: str) -> dict:
@@ -124,25 +139,23 @@ class PanelState:
             if not self.rt:
                 raise RuntimeError("没有已加载的任务")
             d = self.rt.controller.directives.post(target, text)
-            # record on the bus (traffic + planner mirror semantics live in
-            # the envelope layer) so bus_traffic.jsonl shows the exchange.
-            try:
-                env = Envelope(sender="user", receiver=target,
-                               kind=MessageKind.USER_DIRECTIVE,
-                               thread_id="U-%d" % int(time.time() * 1000),
-                               payload={"directive": text})
-                self.rt.bus.submit(env)
-                log = self.rt.runtime / "bus_traffic.jsonl"
-                with open(log, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(
-                        {"at": now_iso(), "kind": env.kind.value,
-                         "sender": "user", "receiver": target,
-                         "payload": {"directive": text}},
-                        ensure_ascii=False) + "\n")
-            except Exception as e:
-                self.errors.append("%s: bus: %s" % (now_iso(), e))
-            return {"target": d.target, "text": d.text, "at": d.at,
-                    "mirrored_to_planner": target != "planner"}
+            # Capture the log path under the lock (rt may be torn down), then
+            # do the disk write OUTSIDE the lock — a slow/full disk must not
+            # stall snapshot/start/stop/set_config, which all need the lock.
+            log = self.rt.runtime / "bus_traffic.jsonl"
+        # 真实投递走上面的 DirectiveChannel（内核 _apply_directives 消费）。
+        # LoopBus 按设计拒绝 user 端点（"no handler for endpoint"），不经过它。
+        # 流量记录由面板自己直写 bus_traffic.jsonl：每条用户指令必须落盘，
+        # 写失败必须冒泡成 API 错误——绝不返回假成功（PV 缺陷 D4）。
+        kind = MessageKind.USER_DIRECTIVE.value
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"at": now_iso(), "kind": kind,
+                 "sender": "user", "receiver": target,
+                 "payload": {"directive": text}},
+                ensure_ascii=False) + "\n")
+        return {"target": d.target, "text": d.text, "at": d.at,
+                "mirrored_to_planner": target != "planner"}
 
     # ---- live config
     def set_config(self, updates: dict) -> dict:
@@ -248,16 +261,18 @@ def list_missions() -> list:
             continue
         try:
             conn = _ro_conn(db)
-            r = _rows(conn, "SELECT payload_json FROM missions LIMIT 1")
-            state, objective = "?", ""
-            if r:
-                payload = json.loads(r[0][0])
-                state = payload.get("state", "?")
-                objective = (payload.get("mission") or {}
-                             ).get("objective", "")[:80]
-            out.append({"mission_id": d.name, "state": state,
-                        "objective": objective})
-            conn.close()
+            try:
+                r = _rows(conn, "SELECT payload_json FROM missions LIMIT 1")
+                state, objective = "?", ""
+                if r:
+                    payload = json.loads(r[0][0])
+                    state = payload.get("state", "?")
+                    objective = (payload.get("mission") or {}
+                                 ).get("objective", "")[:80]
+                out.append({"mission_id": d.name, "state": state,
+                            "objective": objective})
+            finally:
+                conn.close()
         except Exception:
             continue
     return out
@@ -287,70 +302,75 @@ def snapshot() -> dict:
                            "error": str(e)}
         return snap
 
-    def _payloads(table, limit=50):
-        # rowid works on every table (several store tables have no `id`
-        # column — ORDER BY id silently returned nothing via the retry
-        # swallow, e.g. verifications showed 0 rows).
-        rows = _rows(conn, "SELECT payload_json FROM %s ORDER BY rowid DESC "
-                           "LIMIT ?" % table, (limit,))
-        out = []
-        for (p,) in rows:
-            try:
-                out.append(json.loads(p))
-            except Exception:
-                pass
-        return out
+    try:
+        def _payloads(table, limit=50):
+            # rowid works on every table (several store tables have no `id`
+            # column — ORDER BY id silently returned nothing via the retry
+            # swallow, e.g. verifications showed 0 rows).
+            rows = _rows(conn, "SELECT payload_json FROM %s ORDER BY rowid DESC "
+                               "LIMIT ?" % table, (limit,))
+            out = []
+            for (p,) in rows:
+                try:
+                    out.append(json.loads(p))
+                except Exception:
+                    pass
+            return out
 
-    mission_row = _rows(conn, "SELECT payload_json FROM missions LIMIT 1")
-    mission_payload = json.loads(mission_row[0][0]) if mission_row else {}
-    mstate = mission_payload.get("state") or \
-        ("MISSION_READY" if running else "?")
-    counters = {n: v for n, v in _rows(conn,
-                                       "SELECT name, value FROM counters")}
-    transitions = _rows(conn,
-        "SELECT task_id, to_state, actor, reason, timestamp FROM "
-        "state_transitions ORDER BY id DESC LIMIT 40")
-    latest_state = {}
-    for task_id, to_state, actor, reason, ts in transitions:
-        latest_state.setdefault(task_id, (to_state, actor, ts))
-    tasks = []
-    for (spec,) in [(r[0],) for r in _rows(conn,
-                    "SELECT spec_json FROM tasks")]:
-        try:
-            t = json.loads(spec)
-        except Exception:
-            continue
-        tid = t.get("task_id", "?")
-        st = latest_state.get(tid, ("TASK_READY", "", ""))
-        tasks.append({
-            "task_id": tid, "objective": (t.get("objective") or "")[:120],
-            "state": st[0], "actor": st[1], "at": st[2],
-            "worker_session_id": t.get("worker_session_id"),
-            "local_fixes": counters.get("local_fixes:" + tid, 0),
-            "replans": counters.get("replans:" + tid, 0),
-            "max_local_fixes": (t.get("budgets") or {}).get(
-                "max_local_fixes", "?"),
-            "max_replans": (t.get("budgets") or {}).get("max_replans", "?"),
+        mission_row = _rows(conn, "SELECT payload_json FROM missions LIMIT 1")
+        mission_payload = json.loads(mission_row[0][0]) if mission_row else {}
+        mstate = mission_payload.get("state") or \
+            ("MISSION_READY" if running else "?")
+        counters = {n: v for n, v in _rows(conn,
+                                           "SELECT name, value FROM counters")}
+        transitions = _rows(conn,
+            "SELECT task_id, to_state, actor, reason, timestamp FROM "
+            "state_transitions ORDER BY id DESC LIMIT 40")
+        latest_state = {}
+        for task_id, to_state, actor, reason, ts in transitions:
+            latest_state.setdefault(task_id, (to_state, actor, ts))
+        tasks = []
+        for (spec,) in [(r[0],) for r in _rows(conn,
+                        "SELECT spec_json FROM tasks")]:
+            try:
+                t = json.loads(spec)
+            except Exception:
+                continue
+            tid = t.get("task_id", "?")
+            st = latest_state.get(tid, ("TASK_READY", "", ""))
+            tasks.append({
+                "task_id": tid, "objective": (t.get("objective") or "")[:120],
+                "state": st[0], "actor": st[1], "at": st[2],
+                "worker_session_id": t.get("worker_session_id"),
+                "local_fixes": counters.get("local_fixes:" + tid, 0),
+                "replans": counters.get("replans:" + tid, 0),
+                "max_local_fixes": (t.get("budgets") or {}).get(
+                    "max_local_fixes", "?"),
+                "max_replans": (t.get("budgets") or {}).get("max_replans", "?"),
+            })
+        snap.update({
+            "mission": {
+                "id": rt.mission.mission_id,
+                "state": mstate,
+                "reason": mission_payload.get("reason", ""),
+                "objective": rt.mission_dict.get("objective", "")[:200],
+            },
+            "subtasks": sorted(tasks, key=lambda t: t["task_id"]),
+            "transitions": [{"task": t[0], "to": t[1], "actor": t[2],
+                             "reason": (t[3] or "")[:100], "at": t[4]}
+                            for t in transitions[:25]],
+            "gate_runs": _payloads("gate_runs", 6),
+            "audits": _payloads("audits", 4),
+            "verifications": _payloads("verifications", 4),
+            "alerts": _payloads("alerts", 10),
+            "counters": counters,
+            "directives_pending": rt.controller.directives.pending_count(),
         })
-    snap.update({
-        "mission": {
-            "id": rt.mission.mission_id,
-            "state": mstate,
-            "reason": mission_payload.get("reason", ""),
-            "objective": rt.mission_dict.get("objective", "")[:200],
-        },
-        "subtasks": sorted(tasks, key=lambda t: t["task_id"]),
-        "transitions": [{"task": t[0], "to": t[1], "actor": t[2],
-                         "reason": (t[3] or "")[:100], "at": t[4]}
-                        for t in transitions[:25]],
-        "gate_runs": _payloads("gate_runs", 6),
-        "audits": _payloads("audits", 4),
-        "verifications": _payloads("verifications", 4),
-        "alerts": _payloads("alerts", 10),
-        "counters": counters,
-        "directives_pending": rt.controller.directives.pending_count(),
-    })
-    conn.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     # traffic tail
     log = rt.runtime / "bus_traffic.jsonl"
     if log.exists():
@@ -390,8 +410,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
+        # Bound the body size (local panel, but a malformed Content-Length
+        # like 999999999 must not trigger a huge read / OOM) and tolerate a
+        # non-numeric Content-Length without crashing the connection.
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, TypeError):
+            n = 0
         if not n:
+            return {}
+        if n > 10 * 1024 * 1024:  # 10 MB cap; a directive/mission is tiny
             return {}
         try:
             return json.loads(self.rfile.read(n).decode("utf-8"))

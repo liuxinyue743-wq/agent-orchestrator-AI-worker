@@ -111,6 +111,11 @@ class EventNormalizer:
         self._worker_state: Dict[str, str] = {}   # worker_id -> last state
         self._worker_seen: set = set()            # worker ids already started
         self._finished_seen: set = set()
+        # Monotonic per-worker state-change counter, so a state oscillation
+        # (running->idle->running->idle) yields DISTINCT event_ids. Without it
+        # the second idle collides with the first and is dropped by downstream
+        # event_id dedup, hiding real state changes.
+        self._state_seq: Dict[str, int] = {}
 
     # ------------------------------------------------------------ sessions
     def from_session(self, session: Dict) -> List[NormalizedEvent]:
@@ -135,8 +140,12 @@ class EventNormalizer:
                           "branch": session.get("branch")}))
         elif wid in self._worker_state and state and \
                 self._worker_state[wid] != state:
+            seq = self._state_seq.get(wid, 0) + 1
+            self._state_seq[wid] = seq
             events.append(NormalizedEvent(
-                event_id=_event_id(["session", wid, "state", state]),
+                event_id=_event_id(
+                    ["session", wid, "state", str(seq),
+                     self._worker_state[wid], state]),
                 timestamp=last_at, project_id=project_id, task_id=None,
                 worker_id=wid, source="ao_api",
                 event_type="task_state_changed", activity=False, progress=False,
@@ -223,10 +232,17 @@ class EventNormalizer:
                     event_type="file_changed", activity=True, progress=True,
                     progress_strength="weak",
                     message=summary, **base)]
-            fingerprint = self.fp.fingerprint(summary)
-            return [NormalizedEvent(
-                event_type="error", activity=True, progress=False,
-                message=summary, fingerprint=fingerprint, **base)]
+            if status == "failed":
+                fingerprint = self.fp.fingerprint(summary)
+                return [NormalizedEvent(
+                    event_type="error", activity=True, progress=False,
+                    message=summary, fingerprint=fingerprint, **base)]
+            # pending (awaiting approval), running, cancelled, recovered are
+            # NOT failures — treating them as errors polluted REPEATED_ERROR
+            # (multiple pending edits of the same file share a summary -> same
+            # fingerprint -> false alarm). Drop them; they carry no signal the
+            # observer rules or budgets should act on.
+            return []
         return [NormalizedEvent(
             event_type="task_state_changed", activity=False, progress=False,
             message="%s: %s" % (kind or "unknown", summary), **base)]

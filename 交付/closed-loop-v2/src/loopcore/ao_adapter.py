@@ -22,9 +22,6 @@ import urllib.error
 import urllib.request
 from typing import Dict, Iterator, List, Optional
 
-_VALID_JSON_ESCAPES = set('"\\/bfnrtu')
-
-
 class UnsupportedOperation(NotImplementedError):
     """Raised for AO features the daemon does not expose."""
 
@@ -33,12 +30,23 @@ class AOError(RuntimeError):
     """Wrapped AO/HTTP failure with context."""
 
 
+# escapes whose meaning is fixed by JSON (no look-ahead needed)
+_SIMPLE_JSON_ESCAPES = set('"\\/bfnrt')
+
+
 def repair_json(raw: str) -> str:
     """Repair AO's invalid JSON escapes. Character-level pass:
 
-      backslash + valid JSON escape  -> keep as-is
-      backslash + single quote (JS)  -> drop the backslash
-      any other backslash            -> escape it (treat as literal)
+      backslash + simple JSON escape -> keep as-is
+      backslash + u + 4 hex digits    -> keep as-is (valid \\uXXXX)
+      backslash + u (not 4 hex)       -> escape the backslash (treat as literal)
+      backslash + single quote (JS)   -> drop the backslash
+      any other backslash             -> escape it (treat as literal)
+
+    The \\u case is special: Windows paths like ``C:\\users\\lenovo`` contain
+    ``\\u`` followed by non-hex chars; naively keeping ``\\u`` produces invalid
+    JSON (``\\u`` must be followed by exactly 4 hex digits). Only a genuine
+    ``\\uXXXX`` is preserved.
     """
     out = []
     i, n = 0, len(raw)
@@ -46,7 +54,18 @@ def repair_json(raw: str) -> str:
         c = raw[i]
         if c == "\\" and i + 1 < n:
             nxt = raw[i + 1]
-            if nxt in _VALID_JSON_ESCAPES:
+            if nxt == "u":
+                # keep only a genuine \uXXXX; otherwise the backslash is a
+                # lone backslash (e.g. Windows path C:\users\...).
+                if i + 5 < n and _is_hex(raw[i + 2:i + 6]):
+                    out.append(c)
+                    out.append(nxt)
+                    out.append(raw[i + 2:i + 6])
+                    i += 6
+                else:
+                    out.append("\\\\")
+                    i += 1
+            elif nxt in _SIMPLE_JSON_ESCAPES:
                 out.append(c)
                 out.append(nxt)
                 i += 2
@@ -62,8 +81,16 @@ def repair_json(raw: str) -> str:
     return "".join(out)
 
 
+def _is_hex(s: str) -> bool:
+    return len(s) == 4 and all(ch in "0123456789abcdefABCDEF" for ch in s)
+
+
 def loads_relaxed(raw: str):
-    return json.loads(repair_json(raw))
+    """Parse AO JSON after repair; wrap unrecoverable parse errors as AOError."""
+    try:
+        return json.loads(repair_json(raw))
+    except (ValueError, TypeError) as e:
+        raise AOError("malformed AO JSON after repair: %s" % e) from e
 
 
 def _port_from_run_file() -> Optional[str]:
@@ -170,7 +197,15 @@ class AOAdapter:
             if worker.get("isTerminated"):
                 # Terminated sessions answer 409 on /conversation (audit §2.8).
                 continue
-            conv = self.get_worker_conversation(wid)
+            # A session may terminate between get_workers and this call (race).
+            # A 409 on one worker must NOT abort the whole round and drop every
+            # other worker's events — skip just this worker and continue.
+            try:
+                conv = self.get_worker_conversation(wid)
+            except AOError as e:
+                if "HTTP 409" in str(e):
+                    continue
+                raise
             for turn in conv.get("turns") or []:
                 items.append({"kind": "turn", "session_id": wid, "turn": turn})
             for act in conv.get("activities") or []:
@@ -220,6 +255,7 @@ class AOAdapter:
         """
         seen_seq = 0
         url = self.base_url + "/api/v1/events"
+        backoff = 1.0
         while True:
             req = urllib.request.Request(url)
             if seen_seq:
@@ -227,7 +263,16 @@ class AOAdapter:
             try:
                 resp = urllib.request.urlopen(req, timeout=idle_timeout)
             except (urllib.error.URLError, socket.timeout) as e:
-                raise AOError("SSE connect %s -> %s" % (url, e)) from e
+                # Connection failure (daemon restart, network blip): do NOT
+                # kill the stream permanently — the module docstring promises
+                # automatic reconnection. Back off and retry, resuming via
+                # Last-Event-ID. Cap the backoff so a long daemon outage does
+                # not produce unbounded sleeps.
+                time.sleep(min(backoff, 30.0))
+                backoff = min(backoff * 2, 30.0)
+                continue
+            # connected: reset backoff
+            backoff = 1.0
             resp.fp.raw._sock.settimeout(idle_timeout)
             buf = ""
             try:
@@ -239,8 +284,15 @@ class AOAdapter:
                     if not chunk:
                         break
                     buf += chunk.decode("utf-8", errors="replace")
-                    while "\n\n" in buf:
-                        block, buf = buf.split("\n\n", 1)
+                    # Split on blank line: tolerant of both LF (\n\n) and
+                    # CRLF (\r\n\r\n) line endings (AO may emit either).
+                    while "\n\n" in buf or "\r\n\r\n" in buf:
+                        if "\r\n\r\n" in buf and (
+                                not "\n\n" in buf
+                                or buf.index("\r\n\r\n") < buf.index("\n\n")):
+                            block, buf = buf.split("\r\n\r\n", 1)
+                        else:
+                            block, buf = buf.split("\n\n", 1)
                         for line in block.splitlines():
                             if not line.startswith("data:"):
                                 continue

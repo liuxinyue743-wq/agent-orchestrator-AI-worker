@@ -303,9 +303,14 @@ def git_diff_text(worktree: str, base_commit: str, limit: int = 12000) -> str:
                  if p and not _is_artifact(p)]
     if untracked:
         _git(worktree, "add", "-N", "--", *untracked)
-        staged = _git(worktree, "diff", "--", *untracked)
-        out += "\n" + (staged or "")
-        _git(worktree, "reset", "-q", "--", *untracked)
+        try:
+            staged = _git(worktree, "diff", "--", *untracked)
+            out += "\n" + (staged or "")
+        finally:
+            # Always undo the intent-to-add entries; if this is skipped (e.g.
+            # diff raised) the phantom entries linger in the index and pollute
+            # later changed_paths / Verifier diffs.
+            _git(worktree, "reset", "-q", "--", *untracked)
     return _head_tail(out, limit)
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -86,7 +87,13 @@ class LoopBus:
         self._handlers: dict[str, Handler] = {}
         self._issues: dict[str, IssueRecord] = {}
         self._threads: dict[str, _ThreadState] = {}
-        self._seen_idempotency_keys: set[str] = set()
+        # Delivered idempotency keys, in delivery order (LRU eviction at cap).
+        # A key is RESERVEd under the lock before dispatch and COMMITted only
+        # after successful dispatch; a failed dispatch rolls the reservation
+        # back so the caller may retry (idempotent re-entry). This closes the
+        # check/commit race two separate lock sections would otherwise open.
+        self._seen_idempotency_keys: "OrderedDict[str, bool]" = OrderedDict()
+        self._IDEM_CAP = 100000
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------- endpoints
@@ -115,20 +122,47 @@ class LoopBus:
         (the Bus emits one itself via the human handler if registered).
         """
 
+        # --- locked: validation, budget, dedup, hop accounting ---
+        escalate = None  # (env_to_human, reason) if budget exceeded -> send after unlock
         with self._lock:
             self._check_idempotent(envelope)
-            self._check_budget(envelope)
-            envelope = self._dedup(envelope)
-            delivered = envelope.with_hop()
-            state = self._threads[delivered.thread_id]
-            state.hops += 1
-            if delivered.kind is MessageKind.AUDIT_REQUEST:
-                state.audits += 1
-                if state.audits > self.config.max_audits_per_thread:
-                    self._escalate_human(delivered, "max audits per thread exceeded")
-                    raise BudgetExceeded("max audits per thread exceeded")
+            escalate = self._check_budget(envelope)  # may set escalate
+            if escalate is None:
+                envelope = self._dedup(envelope)
+                delivered = envelope.with_hop()
+                state = self._threads[delivered.thread_id]
+                state.hops += 1
+                if delivered.kind is MessageKind.AUDIT_REQUEST:
+                    state.audits += 1
+                    if state.audits > self.config.max_audits_per_thread:
+                        escalate = (delivered, "max audits per thread exceeded")
+        # --- unlocked: dispatch (handler may re-enter the bus) ---
+
+        # Budget exceeded: escalate to HUMAN out-of-lock, then signal the
+        # caller. The idempotency key was reserved but the message was not
+        # delivered — roll the reservation back so the caller may retry after
+        # the human intervenes.
+        if escalate is not None:
+            env, reason = escalate
+            with self._lock:
+                self._seen_idempotency_keys.pop(envelope.idempotency_key, None)
+            self._escalate_human(env, reason)
+            raise BudgetExceeded(reason)
+
         handler = self._resolve_handler(delivered.receiver)
-        handler(delivered)
+        try:
+            handler(delivered)
+        except Exception:
+            # Delivery failed: roll back the reservation so the caller may
+            # retry the same message (idempotent re-entry).
+            with self._lock:
+                self._seen_idempotency_keys.pop(envelope.idempotency_key, None)
+            raise
+        # Delivery succeeded: the reservation made in _check_idempotent IS the
+        # commit (the key is already in the dict). Touch it to mark it as
+        # most-recently-used for LRU eviction order.
+        with self._lock:
+            self._seen_idempotency_keys.move_to_end(envelope.idempotency_key)
         # Owner-ruled visibility: a USER_DIRECTIVE to any endpoint other than
         # the Planner is mirrored to the Planner as USER_DIRECTIVE_COPY, so
         # every user instruction is always visible to the Planner. Directives
@@ -137,7 +171,8 @@ class LoopBus:
             delivered.kind is MessageKind.USER_DIRECTIVE
             and delivered.receiver != Role.PLANNER.value
         ):
-            planner_handler = self._handlers.get(Role.PLANNER.value)
+            with self._lock:
+                planner_handler = self._handlers.get(Role.PLANNER.value)
             if planner_handler is not None:
                 planner_handler(
                     Envelope(
@@ -214,36 +249,56 @@ class LoopBus:
 
     # ------------------------------------------------------------ guards
     def _check_idempotent(self, envelope: Envelope) -> None:
+        """Reject an already-reserved/committed key, otherwise RESERVE it.
+
+        Reservation (not just a check) happens under the lock so that a
+        concurrent submit of the same key cannot pass the check and dispatch
+        twice. The reservation is committed on successful dispatch or rolled
+        back on failure (see submit). LRU-evicts the oldest key at the cap."""
         if envelope.idempotency_key in self._seen_idempotency_keys:
             raise BusError(
                 f"duplicate idempotency key: {envelope.idempotency_key}"
             )
-        self._seen_idempotency_keys.add(envelope.idempotency_key)
+        self._seen_idempotency_keys[envelope.idempotency_key] = True
+        # Bound memory: evict the OLDEST committed key (LRU). move_to_end on
+        # commit keeps recently-delivered keys young; evicting the oldest
+        # minimizes the chance of dropping a key a producer might still retry.
+        if len(self._seen_idempotency_keys) > self._IDEM_CAP:
+            self._seen_idempotency_keys.popitem(last=False)
 
-    def _check_budget(self, envelope: Envelope) -> None:
+    def _check_budget(self, envelope: Envelope):
+        """Return (envelope, reason) if the budget is exceeded (caller must
+        escalate to HUMAN out-of-lock and then raise BudgetExceeded), or
+        None if the message is within budget."""
         now = time.monotonic()
         state = self._threads.get(envelope.thread_id)
         if state is None:
             state = _ThreadState(first_seen_monotonic=now)
             self._threads[envelope.thread_id] = state
         if envelope.hop >= self.config.max_hops_per_thread:
-            self._escalate_human(envelope, "single message hop limit exceeded")
-            raise BudgetExceeded("single message hop limit exceeded")
+            return (envelope, "single message hop limit exceeded")
         if state.hops >= self.config.max_hops_per_thread:
-            self._escalate_human(envelope, "max hops per thread exceeded")
-            raise BudgetExceeded("max hops per thread exceeded")
+            return (envelope, "max hops per thread exceeded")
         if now - state.first_seen_monotonic > self.config.overall_timeout_seconds:
-            self._escalate_human(envelope, "overall thread timeout exceeded")
-            raise BudgetExceeded("overall thread timeout exceeded")
+            return (envelope, "overall thread timeout exceeded")
+        return None
 
     def _resolve_handler(self, receiver: str) -> Handler:
-        handler = self._handlers.get(receiver)
+        # Read the handler dict under the lock (register/has_endpoint mutate it
+        # under the same lock); call the handler out-of-lock. Keeps us safe on
+        # free-threaded Python where dict.get is no longer atomic.
+        with self._lock:
+            handler = self._handlers.get(receiver)
         if handler is None:
             raise RouteNotRegistered(f"no handler for endpoint: {receiver}")
         return handler
 
     def _escalate_human(self, envelope: Envelope, reason: str) -> None:
-        handler = self._handlers.get(Role.HUMAN.value)
+        """Send a HUMAN envelope. Called OUTSIDE the bus lock so a HUMAN
+        handler that re-enters the bus (submit/register/...) cannot deadlock
+        the non-reentrant lock."""
+        with self._lock:
+            handler = self._handlers.get(Role.HUMAN.value)
         if handler is None:
             return
         handler(

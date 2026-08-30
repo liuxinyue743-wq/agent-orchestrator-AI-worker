@@ -45,11 +45,27 @@ def _shellish(text: str) -> bool:
     return bool(_SHELLISH.search(text or ""))
 
 
+# Transient spawn failures (gateway quota windows, rate limits, network
+# blips) recover on their own within minutes — they must NOT burn the small
+# persistent-failure cap (real-run evidence: MISSION-PANEL-20260830-223950
+# dropped BOTH subtasks to HUMAN during one ~8-minute gateway outage).
+_TRANSIENT_SPAWN_RE = _re.compile(
+    r"(429|502|503|504|rate.?limit|quota|overloaded|timed? ?out|"
+    r"temporarily|connection|network|gateway|upstream|econn)",
+    _re.IGNORECASE)
+
+
+def _is_transient_spawn_error(text: str) -> bool:
+    return bool(_TRANSIENT_SPAWN_RE.search(text or ""))
+
+
 class ActionExecutor:
     def __init__(self, ao_bin: str, data_dir: str, run_file: str,
                  store: StateStore, worker_model: str = "",
                  max_spawn_attempts: int = 3,
-                 spawn_backoff_seconds: int = 30):
+                 spawn_backoff_seconds: int = 30,
+                 max_transient_spawn_attempts: int = 8,
+                 transient_spawn_backoff_seconds: int = 90):
         self.ao_bin = ao_bin
         self.data_dir = data_dir
         self.run_file = run_file
@@ -66,6 +82,15 @@ class ActionExecutor:
         # the caller escalates to HUMAN once the cap is reached.
         self.max_spawn_attempts = int(max_spawn_attempts or 3)
         self.spawn_backoff_seconds = int(spawn_backoff_seconds or 30)
+        # Dual budget: TRANSIENT failures (quota/rate-limit/network — see
+        # _TRANSIENT_SPAWN_RE) recover on their own, so they get a separate,
+        # larger allowance with a slower backoff instead of burning the
+        # persistent-failure cap above.
+        self.max_transient_spawn_attempts = int(
+            max_transient_spawn_attempts or 8)
+        self.transient_spawn_backoff_seconds = int(
+            transient_spawn_backoff_seconds or 90)
+        self._last_spawn_error = ""
 
     def _spawn_args(self, project_id: str, harness: str, name: str,
                     prompt: str, include_model: bool = True) -> list:
@@ -87,17 +112,34 @@ class ActionExecutor:
         still worked via the ANTHROPIC_MODEL env default). On that specific
         rejection, retry once WITHOUT --model — same effective model, zero
         operator intervention.
+
+        Failure detail is kept on self._last_spawn_error so the caller can
+        classify transient vs persistent (dual spawn budgets); transport
+        exceptions (timeout etc.) are caught here and read as transient.
         """
-        proc = self._run(self._spawn_args(project_id, harness, name, prompt))
-        if proc.returncode != 0 and self.worker_model and \
-                "config option model" in (proc.stderr or ""):
+        try:
             proc = self._run(self._spawn_args(project_id, harness, name,
-                                              prompt, include_model=False))
+                                              prompt))
+            if proc.returncode != 0 and self.worker_model and \
+                    "config option model" in (proc.stderr or ""):
+                proc = self._run(self._spawn_args(project_id, harness, name,
+                                                  prompt,
+                                                  include_model=False))
+        except Exception as e:  # timeout / transport -> transient
+            self._last_spawn_error = "%s: %s" % (type(e).__name__, e)
+            return None
         if proc.returncode != 0:
+            self._last_spawn_error = ((proc.stderr or "") + " "
+                                      + (proc.stdout or "")).strip()[:300]
             return None
         import re
         m = re.search(r"spawned session (\S+)", proc.stdout or "")
-        return m.group(1) if m else None
+        if m:
+            self._last_spawn_error = ""
+            return m.group(1)
+        self._last_spawn_error = ("rc=0 but no session id in output: "
+                                  + (proc.stdout or ""))[:300]
+        return None
 
     def load_counters(self, task_id: str) -> None:
         """Reload budget counters from the persistent store (survives restart)."""
@@ -178,9 +220,22 @@ class ActionExecutor:
                             new_state=ProjectState.WORKER_RUNNING)
 
     def spawn_cap_reached(self, task_id: str) -> bool:
-        """True when initial-spawn attempts for this task hit the cap."""
-        return self.store.counter_get("spawn_attempts:" + task_id) >= \
-            self.max_spawn_attempts
+        """True when EITHER spawn budget is exhausted: persistent failures
+        hit max_spawn_attempts; transient ones get their own larger budget
+        (gateway quota blips recover within minutes — don't burn the small
+        persistent cap on them)."""
+        return (self.store.counter_get("spawn_attempts:" + task_id)
+                >= self.max_spawn_attempts) or \
+            (self.store.counter_get("spawn_transient:" + task_id)
+             >= self.max_transient_spawn_attempts)
+
+    def spawn_budget_detail(self, task_id: str) -> str:
+        """Human-readable budget usage for halt messages / panel display."""
+        return ("persistent %d/%d, transient %d/%d" % (
+            self.store.counter_get("spawn_attempts:" + task_id),
+            self.max_spawn_attempts,
+            self.store.counter_get("spawn_transient:" + task_id),
+            self.max_transient_spawn_attempts))
 
     def _spawn_backoff_pending(self, task_id: str) -> bool:
         next_at = self.store.counter_get("spawn_next_at:" + task_id)
@@ -194,18 +249,19 @@ class ActionExecutor:
         field so the operator can switch without touching code).
         Returns the new session id or None on failure.
 
-        Bounded: at most `max_spawn_attempts` attempts per task with a
-        linear backoff between them (attempt N waits N*backoff seconds).
-        A successful spawn clears the counters so a later legitimately
-        needed spawn is not blocked by ancient failures.
+        Dual bounded budgets: PERSISTENT failures (config errors etc.) burn
+        `max_spawn_attempts` with N*spawn_backoff_seconds waits; TRANSIENT
+        ones (quota/rate-limit/network, see _TRANSIENT_SPAWN_RE) burn the
+        separate, larger `max_transient_spawn_attempts` budget with slower
+        N*transient_spawn_backoff_seconds waits — gateway blips recover on
+        their own and must not trip the small persistent cap. Counters are
+        incremented AFTER a failed attempt, classified by the captured
+        error text; a successful spawn clears all counters so a later
+        legitimately needed spawn is not blocked by ancient failures.
         """
         if self.spawn_cap_reached(task.task_id) or \
                 self._spawn_backoff_pending(task.task_id):
             return None
-        attempts = self.store.counter_incr("spawn_attempts:" + task.task_id)
-        self.store.counter_set("spawn_next_at:" + task.task_id,
-                               _epoch_seconds() +
-                               self.spawn_backoff_seconds * attempts)
         harness = getattr(task, "worker_harness", "claude-code") or "claude-code"
         gate = "; ".join(task.gate_commands or [])
         prompt = ("Task: %s\n\nAcceptance criteria:\n%s\n\n"
@@ -232,11 +288,21 @@ class ActionExecutor:
         sid = self._spawn(task.project_id, harness,
                           ("worker-%s" % task.task_id)[:20], prompt)
         if sid:
-            # success: clear the retry counters so a future legitimately
+            # success: clear ALL retry counters so a future legitimately
             # needed spawn (e.g. after a replan kill) starts fresh.
-            self.store.counter_delete_prefix("spawn_attempts:" + task.task_id)
-            self.store.counter_delete_prefix("spawn_next_at:" + task.task_id)
-        return sid
+            for pfx in ("spawn_attempts:", "spawn_transient:",
+                        "spawn_next_at:"):
+                self.store.counter_delete_prefix(pfx + task.task_id)
+            return sid
+        if _is_transient_spawn_error(self._last_spawn_error):
+            n = self.store.counter_incr("spawn_transient:" + task.task_id)
+            backoff = self.transient_spawn_backoff_seconds * n
+        else:
+            n = self.store.counter_incr("spawn_attempts:" + task.task_id)
+            backoff = self.spawn_backoff_seconds * n
+        self.store.counter_set("spawn_next_at:" + task.task_id,
+                               _epoch_seconds() + backoff)
+        return None
 
     def _send_local_fix(self, action, task) -> ActionResult:
         if self.local_fixes >= task.budgets["max_local_fixes"]:
@@ -255,7 +321,13 @@ class ActionExecutor:
         proc = self._run(["send", "--session", action.target_session_id,
                           "--message", msg])
         ok = proc.returncode == 0
-        self.local_fixes = self.store.counter_incr("local_fixes:" + task.task_id)
+        if ok:
+            # Only a successful delivery consumes a local-fix budget slot.
+            # A transient `ao send` failure (gateway/rate-limit/network) must
+            # NOT burn the persistent counter — otherwise one transient blip
+            # could push max_local_fixes=2 to its cap and force HUMAN on the
+            # next legitimate fix. (Mirrors _spawn's transient/persistent split.)
+            self.local_fixes = self.store.counter_incr("local_fixes:" + task.task_id)
         return ActionResult(action.action_id, action.action, ok,
                             proc.stdout.strip()[:200] or proc.stderr.strip()[:200],
                             new_state=ProjectState.WORKER_RETRYING if ok
@@ -298,7 +370,18 @@ class ActionExecutor:
                                         "mission max_total_replans exceeded "
                                         "(%d>=%d)" % (used, limit),
                                         new_state=ProjectState.HUMAN)
-                self.store.counter_set(key, used + 1)
+                # NOTE: the mission-level counter is incremented ONLY after a
+                # successful spawn (below). Incrementing here (before spawn)
+                # would (a) burn a slot on a failed spawn, and (b) on a crash
+                # during spawn, double-charge on resume AND orphan the first
+                # spawned worker (re-entry spawns a second one). The per-task
+                # `replans:` counter follows the same "success-only" rule.
+                mission_replan_key = key
+                mission_replan_limit = limit
+            else:
+                mission_replan_key = None
+        else:
+            mission_replan_key = None
         spec = action.replacement_task_spec or {}
         prompt = spec.get("objective", task.objective)
         harness = getattr(task, "worker_harness", "claude-code") or "claude-code"
@@ -310,7 +393,14 @@ class ActionExecutor:
         new_sid = self._spawn(task.project_id, harness,
                               ("replan-%s" % task.task_id)[:20], prompt)
         ok = new_sid is not None
-        self.replans = self.store.counter_incr("replans:" + task.task_id)
+        if ok:
+            # Only a successful re-spawn consumes budget slots — both the
+            # per-task counter and the shared mission-level counter. A failed
+            # or interrupted spawn must not burn either (crash-resume re-enters
+            # _replan_spawn and would otherwise double-charge + orphan workers).
+            self.replans = self.store.counter_incr("replans:" + task.task_id)
+            if mission_replan_key:
+                self.store.counter_incr(mission_replan_key)
         return ActionResult(action.action_id, action.action, ok,
                             ("spawned %s" % new_sid) if ok
                             else "replan spawn failed",

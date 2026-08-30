@@ -23,12 +23,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .llm_env import run_claude
 from .mission_contracts import AcCheck, VerifierResult, validate_verifier_result
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
@@ -132,6 +132,15 @@ class ClaudeCliVerifierProvider(VerifierProvider):
         self._sp_file.flush()
         self._sp_path = self._sp_file.name
 
+    def close(self) -> None:
+        """Remove the on-disk system-prompt temp file. Idempotent."""
+        p = self.__dict__.pop("_sp_path", None)
+        if p:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
     def _env(self) -> Dict[str, str]:
         e = dict(os.environ)
         e["ANTHROPIC_MODEL"] = self.model
@@ -151,10 +160,8 @@ class ClaudeCliVerifierProvider(VerifierProvider):
                "--max-budget-usd", str(self.budget)]
         if use_schema:
             cmd += ["--json-schema", json.dumps(self.schema)]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=self.timeout,
-                              encoding="utf-8", errors="replace",
-                              env=self._env())
+        proc = run_claude(cmd, input=prompt, timeout=self.timeout,
+                          encoding="utf-8", errors="replace", env=self._env())
         out = (proc.stdout or "").strip()
         if not out:
             raise RuntimeError("claude empty stdout rc=%s stderr=%s"

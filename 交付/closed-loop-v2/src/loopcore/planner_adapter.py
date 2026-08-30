@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+from .llm_env import run_claude
 
 from .mission_contracts import (AuditResult, PlannerAction, PlannerActionType,
                         AuditDecision, validate_planner_action)
@@ -195,6 +196,19 @@ class AOOrchestratorPlannerProvider(PlannerProvider):
         self._sp_file.flush()
         self._sp_path = self._sp_file.name
 
+    def close(self) -> None:
+        """Remove the on-disk system-prompt temp files created at construction.
+        Idempotent — safe to call from a finally/atexit path."""
+        import os as _os
+        for attr in ("_sp_path", "_dsp"):
+            p = self.__dict__.get(attr)
+            if p:
+                try:
+                    _os.unlink(p)
+                except OSError:
+                    pass
+                self.__dict__[attr] = None
+
     def _env(self) -> dict:
         e = dict(os.environ)
         e["ANTHROPIC_MODEL"] = self.model
@@ -222,10 +236,8 @@ class AOOrchestratorPlannerProvider(PlannerProvider):
                "--max-budget-usd", str(self.budget)]
         if use_schema:
             cmd += ["--json-schema", json.dumps(self.schema)]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=self.timeout,
-                              encoding="utf-8", errors="replace",
-                              env=self._env())
+        proc = run_claude(cmd, input=prompt, timeout=self.timeout,
+                          encoding="utf-8", errors="replace", env=self._env())
         out = (proc.stdout or "").strip()
         if not out:
             raise RuntimeError("claude empty stdout rc=%s stderr=%s"
@@ -336,10 +348,8 @@ class AOOrchestratorPlannerProvider(PlannerProvider):
                "--max-budget-usd", str(self.budget)]
         if use_schema:
             cmd += ["--json-schema", json.dumps(mschema)]
-        proc = subprocess.run(cmd, input=prompt, capture_output=True,
-                              text=True, timeout=self.timeout,
-                              encoding="utf-8", errors="replace",
-                              env=self._env())
+        proc = run_claude(cmd, input=prompt, timeout=self.timeout,
+                          encoding="utf-8", errors="replace", env=self._env())
         out = (proc.stdout or "").strip()
         if not out:
             raise RuntimeError("claude empty stdout rc=%s stderr=%s"

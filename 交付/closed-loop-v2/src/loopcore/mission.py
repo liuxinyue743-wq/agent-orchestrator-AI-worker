@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -75,6 +76,10 @@ class MissionController:
         # drained once per tick and routed to each target's real input.
         from .directives import DirectiveChannel
         self.directives = DirectiveChannel()
+        # User-stop latch (panel /api/stop): set by request_stop(); every
+        # controller checkpoint and every subtask loop (shared via
+        # _build_loop) refuses to act once raised.
+        self._stop_event = threading.Event()
 
     # ------------------------------------------------------------- state
     @property
@@ -83,21 +88,47 @@ class MissionController:
 
     def _set_state(self, s: str, reason: str) -> None:
         """Mission state lives in the store (per-DB, not a shared file) so
-        parallel/renamed stores never cross-contaminate."""
+        parallel/renamed stores never cross-contaminate.
+
+        The terminal-state check and the write happen atomically inside the
+        store lock (record_mission_state_atomic), so a mission thread writing
+        MISSION_DONE and a panel thread writing HUMAN via request_stop() cannot
+        both pass the check and have the loser clobber the winner's terminal
+        state. The first terminal write wins."""
         prev = self.state
+        # Local pre-check keeps the common (non-racing) path cheap and lets us
+        # skip worker cleanup when no transition actually occurs; the store's
+        # atomic method is the source of truth under contention.
+        if prev in MISSION_TERMINAL and s != prev:
+            return
         self._mission_row = {"state": s, "reason": reason, "at": now_iso()}
-        self.store.record_mission(
-            self.mission.mission_id,
-            {"state": s, "reason": reason,
-             "mission": self.mission.to_dict(),
-             "plan": self.plan.to_dict() if self.plan else None})
+        # Only carry the plan when we hold one: with store-level merging, an
+        # explicit "plan": null would erase a previously recorded plan.
+        payload = {"reason": reason, "at": now_iso(),
+                   "mission": self.mission.to_dict()}
+        if self.plan is not None:
+            payload["plan"] = self.plan.to_dict()
+        merged = getattr(self, "merged", None)
+        if merged:
+            payload["merged"] = list(merged)
+        landed = self.store.record_mission_state_atomic(
+            self.mission.mission_id, s, payload)
+        if not landed:
+            # A concurrent terminal write won; do not run terminal cleanup for
+            # a transition that did not land.
+            self._mission_row = None  # force re-read from store next time
+            return
         # Terminal transition: stop every still-bound live worker. A mission
         # that halts (merge conflict, FAILED subtask, budget) must not leave
         # orphan workers running against a mission nobody will merge — their
         # output would land in worktrees no controller ever reads again
         # (real-run: MISSION-PANEL-203226 S2 completed `half()` into a void).
         if s in MISSION_TERMINAL and prev != s and not self.dry_run:
-            for sid, task in self.tasks.items():
+            # Snapshot tasks before iterating: kill_worker shells out (releases
+            # the GIL), and a concurrent _decompose on the mission thread could
+            # otherwise insert a key mid-iteration -> "dict changed size during
+            # iteration". request_stop() can reach here from a panel thread.
+            for sid, task in list(self.tasks.items()):
                 if task.worker_session_id:
                     try:
                         self.executor.kill_worker(task.worker_session_id)
@@ -119,6 +150,17 @@ class MissionController:
         except Exception:
             pass
         return {}
+
+    # ------------------------------------------------------------- stop
+    def request_stop(self) -> None:
+        """User-initiated stop (panel /api/stop). Lands the mission in HUMAN
+        immediately — the terminal transition inside _set_state reaps every
+        still-bound worker — and raises the shared stop event so every
+        controller checkpoint and subtask loop refuses further work.
+        Idempotent; a mission already terminal is left untouched."""
+        self._stop_event.set()
+        if self.state not in MISSION_TERMINAL:
+            self._set_state("HUMAN", "stopped by user")
 
     # ------------------------------------------------------------- step
     # Consecutive mission-tick exceptions tolerated before halting to HUMAN
@@ -169,6 +211,10 @@ class MissionController:
         result = {"state": self.state, "acted": False}
         if self.state in MISSION_TERMINAL:
             return result
+        # User stop: act no further (request_stop already landed HUMAN and
+        # reaped the workers; an in-flight tick just unwinds from here).
+        if self._stop_event.is_set():
+            return result
         # mission runtime watchdog
         if self._runtime_exceeded():
             self._set_state("HUMAN", "mission max_runtime_seconds exceeded")
@@ -188,6 +234,9 @@ class MissionController:
         self._collect_all_events()
         self._apply_directives()
         for sid, task in list(self.tasks.items()):
+            if self._stop_event.is_set():
+                result["state"] = self.state
+                return result
             loop = self.loops.get(sid)
             if loop is None:
                 continue
@@ -196,8 +245,14 @@ class MissionController:
             else:
                 evs = []
             loop.step(injected_events=evs)
+        if self._stop_event.is_set():
+            result["state"] = self.state
+            return result
         # dispatch newly-ready subtasks (deps satisfied)
         self._dispatch_ready()
+        if self._stop_event.is_set():
+            result["state"] = self.state
+            return result
         # merge finished subtasks into the integration worktree
         self._merge_done()
         # any subtask terminally FAILED -> the mission cannot deliver its
@@ -222,7 +277,8 @@ class MissionController:
             self._set_state("HUMAN",
                             "subtask(s) halted for human: %s" % ", ".join(human))
         # all subtasks DONE (+ merged) -> final gate + mission verifier
-        elif self._all_done() and len(self.merged) == len(self.tasks):
+        elif not self._stop_event.is_set() \
+                and self._all_done() and len(self.merged) == len(self.tasks):
             result["acted"] = True
             self._final_verify()
         result["state"] = self.state
@@ -234,23 +290,46 @@ class MissionController:
     # ------------------------------------------------------- decomposition
     def _hydrate(self) -> bool:
         """Rebuild plan/tasks/loops from the store after a process restart.
-        Returns True when a plan was found (skip decomposition)."""
+        Returns True when a plan was found (skip decomposition). A corrupted
+        mission row is escalated to HUMAN (not re-decomposed) — fresh subtask_ids
+        would orphan already-dispatched workers."""
+        with self.store._lock:
+            cur = self.store._conn.execute(
+                "SELECT payload_json FROM missions WHERE mission_id=?",
+                (self.mission.mission_id,))
+            r = cur.fetchone()
+        if not r:
+            return False
         try:
-            with self.store._lock:
-                cur = self.store._conn.execute(
-                    "SELECT payload_json FROM missions WHERE mission_id=?",
-                    (self.mission.mission_id,))
-                r = cur.fetchone()
-            if not r:
-                return False
             d = json.loads(r[0])
+        except (ValueError, TypeError):
+            # A partially-written/corrupted mission row (crash mid-write; WAL
+            # lowers but does not eliminate this). Re-decomposing would mint
+            # new subtask_ids and orphan workers already running under the old
+            # ids -> fail closed to HUMAN instead.
+            self._set_state("HUMAN",
+                            "mission row corrupted on resume; manual review "
+                            "required (re-decompose would orphan workers)")
+            return True
+        try:
             plan_d = d.get("plan")
             if not plan_d or not plan_d.get("subtasks"):
                 return False
             self.plan = MissionPlan.from_dict(plan_d)
             self._mission_row = d
+            # Restore the merged-subtask list so _all_done+merged can re-fire
+            # final verify after a crash. Without this, merged==[] on resume;
+            # if a subtask's worktree was since cleaned up, _merge_done skips it
+            # forever and final verify never triggers (mission never terminates).
+            restored = d.get("merged") or []
+            if isinstance(restored, list):
+                valid = {s.subtask_id for s in self.plan.subtasks}
+                self.merged = [s for s in restored if s in valid]
         except Exception:
-            return False
+            self._set_state("HUMAN",
+                            "mission plan unreadable on resume; manual review "
+                            "required (re-decompose would orphan workers)")
+            return True
         # tasks were recorded at decomposition/dispatch time; rebuild loops
         for sub in self.plan.subtasks:
             spec_d = self.store.load_task(sub.subtask_id)
@@ -282,7 +361,8 @@ class MissionController:
             observer=self._shared_observer, adapter=self.adapter,
             gate=self.gate, store=self.store, verifier=self.verifier,
             dry_run=self.dry_run,
-            instruct=self.mission.user_instruction)
+            instruct=self.mission.user_instruction,
+            stop_event=self._stop_event)
         loop.board = self._progress_board
         loop.hold_spawn = True
         return loop
@@ -295,10 +375,23 @@ class MissionController:
         except Exception as e:  # noqa
             self._set_state("HUMAN", "decomposition failed twice: %s" % e)
             return
+        # Stopped while the planner was thinking: drop the plan entirely and
+        # keep the HUMAN row untouched — the next resume re-decomposes.
+        if self._stop_event.is_set():
+            return
         self.plan = plan
         self.store.record_mission(self.mission.mission_id, {
             "mission": self.mission.to_dict(),
             "plan": plan.to_dict()})
+        # An empty decomposition (LLM returned 0 subtasks) would leave
+        # self.tasks empty -> _all_done() False forever, no terminal condition
+        # tripped, mission spins until the runtime watchdog (if any) kills it.
+        # Fail closed to HUMAN instead of looping on nothing.
+        if not plan.subtasks:
+            self._set_state("HUMAN",
+                            "decomposition produced 0 subtasks "
+                            "(empty plan from planner)")
+            return
         # materialize one TaskSpec + ClosedLoop per subtask
         for sub in plan.subtasks:
             task = TaskSpec(
@@ -351,8 +444,8 @@ class MissionController:
                 if loop is not None and self._subtask_state(sid) not in (
                         ProjectState.HUMAN, ProjectState.FAILED):
                     loop._halt_budget(
-                        "initial worker spawn failed %d times (cap reached)"
-                        % self.executor.max_spawn_attempts)
+                        "initial worker spawn budget exhausted (%s)"
+                        % self.executor.spawn_budget_detail(task.task_id))
                 continue
             new_sid = self.executor.spawn_initial_worker(task)
             if new_sid:
@@ -376,12 +469,20 @@ class MissionController:
         real input path (see directives.py for the routing table).
         Owner-ruled visibility: non-planner directives are ALWAYS mirrored
         into the planner's instruct as well."""
+        def _append_instruct(loop, line):
+            # Bound the accumulated instruct so a long mission with many panel
+            # directives does not grow the Planner prompt without limit (which
+            # would slow every planner call and could exceed the CLI length
+            # cap). Keep the most recent 20 directive lines.
+            parts = (loop.instruct + "\n" + line).splitlines()
+            loop.instruct = "\n".join(parts[-20:]).strip()
+
         for d in self.directives.drain():
             target, text = d.target, d.text
             stamp = "[用户指令 %s] %s" % (d.at[:19], text)
             if target == "planner":
                 for loop in self.loops.values():
-                    loop.instruct = (loop.instruct + "\n" + stamp).strip()
+                    _append_instruct(loop, stamp)
                 continue
             if target.startswith("worker:"):
                 sid = target.split(":", 1)[1]
@@ -389,22 +490,19 @@ class MissionController:
                     self.executor.nudge_worker(sid, stamp)
                 # mirror to planner (visibility rule)
                 for loop in self.loops.values():
-                    loop.instruct = (loop.instruct + "\n[镜像·发给 %s] %s"
-                                     % (target, stamp)).strip()
+                    _append_instruct(loop, "[镜像·发给 %s] %s" % (target, stamp))
                 continue
             if target in ("auditor", "verifier"):
                 for loop in self.loops.values():
                     dq = loop.role_directives[target]
                     dq.append(stamp)
                     del dq[:-20]
-                    loop.instruct = (loop.instruct + "\n[镜像·发给 %s] %s"
-                                     % (target, stamp)).strip()
+                    _append_instruct(loop, "[镜像·发给 %s] %s" % (target, stamp))
                 continue
             # observer / gate: deterministic programs, no semantic input —
             # planner visibility only.
             for loop in self.loops.values():
-                loop.instruct = (loop.instruct + "\n[镜像·发给 %s] %s"
-                                 % (target, stamp)).strip()
+                _append_instruct(loop, "[镜像·发给 %s] %s" % (target, stamp))
 
     def _collect_all_events(self) -> None:
         """One API call; raw items cached for per-worker routing.
@@ -554,6 +652,14 @@ class MissionController:
                         task.worker_session_id)
             if not worktree.exists():
                 continue
+            # Stop the worker BEFORE committing its worktree: if the AO session
+            # is still alive it may write to the worktree mid-merge (cleanup,
+            # cache, hooks), and commit_all would capture a half-baked state
+            # into the integration branch. kill_worker is idempotent.
+            try:
+                self.executor.kill_worker(task.worker_session_id)
+            except Exception:
+                pass  # best-effort; a dead worker is fine, merge must proceed
             sha = wt.commit_all(str(worktree), "subtask %s" % sid)
             integ = self._integration_wt()
             if not integ or not sha:
@@ -563,6 +669,10 @@ class MissionController:
             r = wt.merge_worktree(integ, str(worktree))
             if r.status == wt.MergeOutcome.OK:
                 self.merged.append(sid)
+                # Persist merged so a crash-resume can re-fire final verify
+                # even if this subtask's worktree is later cleaned up.
+                self.store.record_mission(self.mission.mission_id,
+                                          {"merged": list(self.merged)})
             elif r.status == wt.MergeOutcome.CONFLICT:
                 # deterministic conflict -> human escalation (bounded)
                 self._set_state("HUMAN",

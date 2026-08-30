@@ -52,7 +52,8 @@ class ClosedLoop:
                  store: StateStore,
                  verifier: Optional["VerifierProvider"] = None,
                  dry_run: bool = False,
-                 instruct: str = ""):
+                 instruct: str = "",
+                 stop_event=None):
         self.task = task
         self.cfg = cfg
         self.auditor = auditor
@@ -80,6 +81,16 @@ class ClosedLoop:
         # worker — the MissionController dispatches subtasks in dependency
         # order and sets worker_session_id itself.
         self.hold_spawn = False
+        # Per-task activity-sequence cursor for _collect_events: avoids pulling
+        # the full activity history every tick (O(N^2) over a long task).
+        self._event_since: Dict[str, int] = {}
+        # Mission-level user stop (panel /api/stop), shared by the
+        # MissionController; once raised, this loop's checkpoints refuse to
+        # act. Standalone runs get a private never-set event.
+        if stop_event is None:
+            import threading as _threading
+            stop_event = _threading.Event()
+        self._stop_event = stop_event
 
     # ----------------------------------------------------------- state
     @property
@@ -152,6 +163,10 @@ class ClosedLoop:
         result = {"state": self.state, "acted": False}
         if self.state in (ProjectState.DONE, ProjectState.HUMAN,
                           ProjectState.FAILED):
+            return result
+        # User stop (mission-level): act no further — no new audits,
+        # decisions, dispatches or gate runs once the stop latch is raised.
+        if self._stop_event.is_set():
             return result
         # Runtime watchdog: enforce max_runtime_seconds (budget).
         if self._runtime_exceeded():
@@ -667,7 +682,20 @@ class ClosedLoop:
 
     def _collect_events(self, worker_id: str) -> List:
         pid = self.task.project_id
-        items = self.adapter.get_recent_events(pid, since=0)
+        # Advance the activity cursor: pulling every activity from sequence 0
+        # each tick is O(N) per poll and O(N^2) over a long task, which can
+        # trip AO rate-limits and stall the single-threaded controller. We
+        # remember the highest sequence seen for this task and ask only for
+        # newer activities (sessions/turns are always returned by AO).
+        # Cursor is keyed by WORKER SESSION, not task_id: a replan spawns a new
+        # session whose activity sequence restarts at 1. A task_id-keyed cursor
+        # would carry the old worker's high sequence over and silently drop the
+        # new worker's early activities (its errors during incubation). Per-
+        # worker also prevents a sibling worker's high sequence from raising
+        # this cursor (which would skip this worker's mid-range activities).
+        since = self._event_since.get(worker_id, 0)
+        items = self.adapter.get_recent_events(pid, since=since)
+        max_seq = since
         turn_times: Dict[str, Dict[str, str]] = {}
         evs = []
         for item in items:
@@ -676,6 +704,13 @@ class ClosedLoop:
                 turn_times.setdefault(item["session_id"], {})[str(t.get("id"))] \
                     = t.get("requestedAt") or t.get("completedAt")
         for item in items:
+            # Only this worker's activities advance THIS worker's cursor; a
+            # sibling worker's high sequence must not raise it.
+            if (item.get("kind") == "activity"
+                    and item.get("session_id") == worker_id):
+                s = item["activity"].get("sequence") or 0
+                if s > max_seq:
+                    max_seq = s
             if item.get("session_id") != worker_id:
                 # still feed session-level events for this worker
                 if item["kind"] == "session" and \
@@ -690,12 +725,33 @@ class ClosedLoop:
                 evs += self.normalizer().from_activity(
                     worker_id, pid, item["activity"],
                     turn_times.get(worker_id, {}), None)
+        self._event_since[worker_id] = max_seq
         return evs
 
+    def _fresh_history(self) -> dict:
+        """Executor counters refreshed for THIS task before embedding in a
+        bundle. The executor is shared across subtask loops (MissionController
+        builds one executor for all loops), and its local_fixes/replans
+        instance attrs only reflect the task from the last load_counters call.
+        Reading them stale (e.g. before _to_planner's load_counters) would
+        feed subtask B the counters of subtask A — wrong audit/verify evidence.
+        load_counters is cheap and idempotent."""
+        self.executor.load_counters(self.task.task_id)
+        return {"local_fixes": self.executor.local_fixes,
+                "replans": self.executor.replans}
+
     def normalizer(self) -> EventNormalizer:
-        n = EventNormalizer(self.cfg.get("fingerprint"),
-                            bool(self.cfg.get("observer", {}).get(
-                                "turn_diff_counts_as_progress", True)))
+        # Reuse ONE long-lived normalizer per ClosedLoop. Its session-level
+        # state (_worker_seen, _worker_state, _state_seq) tracks state changes
+        # and de-dups worker_started/finished across ticks — a fresh instance
+        # per item reset that state every call, suppressing task_state_changed
+        # events (the _state_seq oscillation fix was effectively dead).
+        n = getattr(self, "_normalizer", None)
+        if n is None:
+            n = EventNormalizer(self.cfg.get("fingerprint"),
+                                bool(self.cfg.get("observer", {}).get(
+                                    "turn_diff_counts_as_progress", True)))
+            self._normalizer = n
         return n
 
     # ----------------------------------------------------------- alert->audit
@@ -794,8 +850,7 @@ class ClosedLoop:
             test_output=test_output,
             satisfied_criteria=satisfied,
             failed_criteria=failed,
-            history={"local_fixes": self.executor.local_fixes,
-                     "replans": self.executor.replans,
+            history={**self._fresh_history(),
                      # user directives addressed to the Auditor (panel
                      # channel): the prompt builder embeds the bundle, so
                      # the Auditor sees them with the evidence.
@@ -884,6 +939,14 @@ class ClosedLoop:
         if not payload:
             # No audit survived the crash: fall back to a fresh completion
             # audit so the Auditor re-derives the decision from evidence.
+            # _completion_audit can only be entered from AUDIT_PENDING (or a
+            # worker-active state); PLANNER_PENDING -> AUDIT_PENDING is NOT a
+            # legal transition, so step through WORKER_RUNNING first (legal)
+            # to avoid _halt_budget sending us straight to HUMAN.
+            if self.state == ProjectState.PLANNER_PENDING and \
+                    is_legal_transition(self.state, ProjectState.WORKER_RUNNING):
+                self._transition(ProjectState.WORKER_RUNNING, "closed_loop",
+                                 "resume: no audit survived -> re-audit", {})
             self._completion_audit()
             return
         self._to_planner(AuditResult.from_dict(payload))
@@ -918,7 +981,7 @@ class ClosedLoop:
             else None
         pa = self.planner.plan(audit, self.task.to_dict(), action_id,
             target_session_id=self.task.worker_session_id,
-            remaining_replans=max(0, self.task.budgets["max_replans"]
+            remaining_replans=max(0, self.task.budgets.get("max_replans", 1)
                                    - self.executor.replans),
             instruct=self.instruct, board=board)
         ok, msg = pa.validate()
@@ -979,9 +1042,13 @@ class ClosedLoop:
                 "path violations: %s" % ", ".join(violations),
                 {"forbidden": forbidden, "outside_allowed": outside})
             return
-        run = self.gate.run(self.task, worktree)
         if self.dry_run:
+            # dry-run must NOT execute the real gate subprocess (pytest etc.).
+            # Park in GATE_PENDING; a real-mode run will execute the gate.
+            # (The guard previously sat AFTER gate.run, so --dry-run still ran
+            # the gate — violating the dry-run contract.)
             return
+        run = self.gate.run(self.task, worktree)
         target = ProjectState.VERIFIER_PENDING if run.ok \
             else ProjectState.AUDIT_PENDING
         if is_legal_transition(self.state, target):
@@ -1019,8 +1086,7 @@ class ClosedLoop:
                     failed_criteria=[ac.id for ac in self.task.acceptance_criteria],
                     test_output="\n".join(r["stdout"] + r["stderr"]
                                           for r in run.results),
-                    history={"local_fixes": self.executor.local_fixes,
-                             "replans": self.executor.replans,
+                    history={**self._fresh_history(),
                              "user_directives":
                                  self.role_directives["auditor"][-10:]})
                 audit = self.auditor.audit(bundle, audit_id)
@@ -1045,9 +1111,46 @@ class ClosedLoop:
                             "no worktree path resolvable", {})
             return
         verifier = self.verifier or FakeVerifierProvider()
-        verify_id = make_id("VERIFY")
-        if self.store.verification_seen(verify_id):
-            return
+        # Deterministic verify_id keyed on (task, worker session): the same
+        # VERIFIER_PENDING re-entry (crash-resume) maps to the same id, so a
+        # verdict already recorded in the narrow window before the DONE/AUDIT
+        # transition can be reused instead of re-running the non-deterministic
+        # LLM verifier (which could flip PASS->FAIL). A replan spawns a new
+        # worker session -> a new id -> a fresh verification (never skipped).
+        verify_id = stable_id("VERIFY", self.task.task_id,
+                              self.task.worker_session_id or "", length=16)
+        # Reuse a recorded verdict ONLY on a genuine crash-resume re-entry: the
+        # loop is already in VERIFIER_PENDING (a completed verify would have
+        # moved it to DONE/AUDIT_PENDING), so a recorded verdict here means the
+        # process was killed in the narrow window between record_verification
+        # and the state transition. Re-running the non-deterministic LLM could
+        # flip the result, so we replay the recorded verdict.
+        #
+        # In every OTHER path into _run_verifier (e.g. a local-fix cycle: FAIL
+        # -> worker fixes on the SAME session -> gate pass -> re-verify) the
+        # state is NOT VERIFIER_PENDING yet, so even though verification_seen
+        # is True we fall through and re-run the verifier — otherwise the old
+        # FAIL verdict would permanently suppress re-verification for that
+        # worker and the loop would burn max_local_fixes into HUMAN.
+        if (self.state == ProjectState.VERIFIER_PENDING
+                and self.store.verification_seen(verify_id)):
+            prior = self.store.get_verification(verify_id)
+            prior_verdict = (prior or {}).get("verdict")
+            if prior_verdict == "PASS":
+                if is_legal_transition(self.state, ProjectState.DONE):
+                    self._transition(ProjectState.DONE, "verifier",
+                                     "verifier PASS (resumed): %s"
+                                     % str((prior or {}).get("summary", ""))[:200],
+                                     {"verify_id": verify_id, "resumed": True})
+                return
+            if prior_verdict == "FAIL":
+                if is_legal_transition(self.state, ProjectState.AUDIT_PENDING):
+                    self._transition(ProjectState.AUDIT_PENDING, "verifier",
+                                     "verifier FAIL (resumed): %s"
+                                     % str((prior or {}).get("summary", ""))[:200],
+                                     {"verify_id": verify_id, "resumed": True})
+                return
+            # verdict unknown/unparseable -> re-verify (falls through)
         if self.state != ProjectState.VERIFIER_PENDING:
             if is_legal_transition(self.state, ProjectState.VERIFIER_PENDING):
                 self._transition(ProjectState.VERIFIER_PENDING, "closed_loop",
@@ -1106,7 +1209,7 @@ class ClosedLoop:
             # like malformed verifier output, not a real rejection. Retry
             # ONCE with a fresh id; a second incoherent FAIL goes to HUMAN
             # (bounded — never re-enters audit with empty evidence).
-            retry_id = make_id("VERIFY-RETRY")
+            retry_id = stable_id("VERIFY-RETRY", verify_id, length=16)
             if not self.store.verification_seen(retry_id):
                 second = verifier.verify(inp, retry_id)
                 self.store.record_verification(retry_id, self.task.task_id,
@@ -1170,8 +1273,7 @@ class ClosedLoop:
                                         [ac.id for ac in
                                          self.task.acceptance_criteria],
                         test_output=gate_output,
-                        history={"local_fixes": self.executor.local_fixes,
-                                 "replans": self.executor.replans,
+                        history={**self._fresh_history(),
                                  "user_directives":
                                      self.role_directives["auditor"][-10:]})
                     audit = self.auditor.audit(bundle, audit_id)
@@ -1208,8 +1310,7 @@ class ClosedLoop:
             test_output=test_output,
             satisfied_criteria=satisfied,
             failed_criteria=failed,
-            history={"local_fixes": self.executor.local_fixes,
-                     "replans": self.executor.replans,
+            history={**self._fresh_history(),
                      "user_directives": self.role_directives["auditor"][-10:]},
             audit_type="COMPLETION")
         audit = self.auditor.audit(bundle, audit_id)

@@ -58,35 +58,60 @@ def path_matches(rel_path: str, patterns: list[str]) -> bool:
     return False
 
 
+# Shell metacharacters that allow chaining/redirecting to arbitrary commands.
+# Any approval-seeking command containing one of these stays pending — the
+# worker could otherwise smuggle a destructive command past the gate prefix
+# (e.g. ``pytest tests/ && rm -rf C:/``).
+_SHELL_METACHARS = ("&&", "||", ";", "|", ">", "<", "`", "$", "&", "\n", "\r")
+
+
+def _has_shell_metachar(cmd: str) -> bool:
+    return any(mc in cmd for mc in _SHELL_METACHARS)
+
+
 def is_safe_command(cmd: str, gate_commands: list[str]) -> bool:
     """True when a command approval may be granted unattended.
 
     Allowed: the task's own gate commands (any -q/-v verbosity variant),
     pytest invocations, and read/add/commit git bookkeeping. Everything else
     (arbitrary shell, network, installs, deletion) stays pending.
+
+    Safety: any command containing a shell metacharacter (``&&``, ``;``,
+    ``|``, ``>``, ``$``, ...) is rejected outright — the gate/pytest/git
+    prefixes are matched at token granularity so a prefix cannot be abused
+    to smuggle a chained destructive command.
     """
 
     cmd = " ".join((cmd or "").split())
     if not cmd:
         return False
+    # Reject anything that could chain/redirect to a second command.
+    if _has_shell_metachar(cmd):
+        return False
+    tokens = cmd.split(" ")
     for gate in gate_commands or []:
         g = " ".join(str(gate).split())
         if not g:
             continue
-        if (
-            cmd == g
-            or cmd.startswith(g + " ")
-            or g.startswith(cmd + " ")
-            or cmd.rstrip(" -v").rstrip(" -q") == g.rstrip(" -q")
-        ):
+        g_tokens = g.split(" ")
+        # A gate command matches if it is a token-prefix of cmd (cmd may add
+        # verbosity flags / paths), or cmd is a token-prefix of it. Token
+        # granularity prevents ``pytest tests/ && ...`` from matching ``pytest``.
+        if tokens[: len(g_tokens)] == g_tokens or g_tokens[: len(tokens)] == tokens:
             return True
-    head = cmd.split(" ", 1)[0]
+        # verbosity-tail variant: ``cmd -q -v`` ~= ``cmd`` (drop only -q/-v)
+        def _strip_verbosity(ts: list[str]) -> list[str]:
+            return [t for t in ts if t not in ("-q", "-v", "-qq", "-vv")]
+        if _strip_verbosity(tokens) == _strip_verbosity(g_tokens):
+            return True
+    head = tokens[0]
     if head in ("python", "python3", "py"):
-        rest = cmd[len(head):].strip()
-        if rest.startswith("-m pytest"):
+        # exact ``python -m pytest ...``; -m must be followed by the literal
+        # module ``pytest`` (not ``pytest_evil`` / ``pytest_cov_anything``).
+        if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
             return True
     if head == "git":
-        sub = cmd.split(" ")[1:2]
+        sub = tokens[1:2]
         if sub and sub[0] in (
             "add", "commit", "status", "diff", "log", "restore", "checkout",
         ):

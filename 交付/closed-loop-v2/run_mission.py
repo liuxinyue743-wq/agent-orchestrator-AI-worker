@@ -80,15 +80,27 @@ class MissionRuntime:
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.store = StateStore(str(self.runtime / "state.db"))
         self.adapter = AOAdapter()
+        wcfg = cfg.get("worker") or {}
         self.executor = ActionExecutor(
             ao_bin=AO_BIN, data_dir=AO_DATA_DIR, run_file=AO_RUN_FILE,
             store=self.store,
-            worker_model=(cfg.get("worker") or {}).get("model", ""))
+            worker_model=wcfg.get("model", ""),
+            max_spawn_attempts=int(wcfg.get("spawn_max_attempts", 3)),
+            spawn_backoff_seconds=int(wcfg.get("spawn_backoff_seconds", 30)),
+            max_transient_spawn_attempts=int(
+                wcfg.get("spawn_max_transient_attempts", 8)),
+            transient_spawn_backoff_seconds=int(
+                wcfg.get("spawn_transient_backoff_seconds", 90)))
         self.gate = IntegrationGate(self.store)
         planner = AOOrchestratorPlannerProvider(
             project_id=mission_dict["project_id"], timeout=120)
         auditor = ClaudeCliAuditorProvider(timeout=120)
         verifier = ClaudeCliVerifierProvider(timeout=120)
+        # Keep references so close() can release their temp files; the panel
+        # creates a MissionRuntime per mission and must not leak .md files.
+        self._planner = planner
+        self._auditor = auditor
+        self._verifier = verifier
         self.mission = MissionSpec.from_dict(mission_dict)
         self.controller = MissionController(
             self.mission, cfg,
@@ -106,6 +118,22 @@ class MissionRuntime:
         self.projector = StoreBusProjector(
             self.store, self.bus, self.memory,
             traffic_log=self.runtime / "bus_traffic.jsonl")
+
+    def close(self) -> None:
+        """Release provider temp files and the sqlite connection. Idempotent.
+        The panel calls this when a mission is unloaded; the CLI path relies
+        on process exit, but close() makes long-running panel use leak-free."""
+        for prov in (self._planner, self._auditor, self._verifier):
+            fn = getattr(prov, "close", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        try:
+            self.store.close()
+        except Exception:
+            pass
 
 
 def build_runtime(mission_dict: dict, cfg: dict, *,

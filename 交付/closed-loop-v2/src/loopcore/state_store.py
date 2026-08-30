@@ -185,6 +185,26 @@ class StateStore:
                 "SELECT 1 FROM verifications WHERE verify_id=?", (verify_id,))
             return cur.fetchone() is not None
 
+    def get_verification(self, verify_id: str) -> Optional[Dict]:
+        """Return the recorded verification payload for ``verify_id``, or None.
+
+        Used by crash-resume: when a verifier PASS was recorded but the
+        DONE transition did not land (process killed in the narrow window
+        between record_verification and _transition), re-entry can read the
+        prior verdict instead of re-running the non-deterministic LLM.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT payload_json FROM verifications WHERE verify_id=?",
+                (verify_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            try:
+                return json.loads(r[0])
+            except (ValueError, TypeError):
+                return None
+
     def record_verification(self, verify_id: str, task_id: str,
                             payload: Dict) -> None:
         with self._lock:
@@ -198,12 +218,70 @@ class StateStore:
     # ---------------------------------------------------------- missions
     def record_mission(self, mission_id: str, payload: Dict) -> None:
         with self._lock:
+            # Merge into any existing row (new keys win) instead of a blind
+            # REPLACE: a terminal state written by request_stop() must survive
+            # a later plan-only write from an unwinding in-flight tick
+            # (real race, PV S9: stop during decompose -> the decompose
+            # record_mission({"mission","plan"}) clobbered the HUMAN row and
+            # the panel showed state "?").
+            cur = self._conn.execute(
+                "SELECT payload_json FROM missions WHERE mission_id=?",
+                (mission_id,))
+            row = cur.fetchone()
+            merged: Dict = {}
+            if row:
+                try:
+                    merged = json.loads(row[0])
+                except (ValueError, TypeError):
+                    merged = {}
+            merged.update(payload)
             self._conn.execute(
                 "INSERT OR REPLACE INTO missions(mission_id,payload_json,recorded_at)"
                 " VALUES(?,?,?)",
-                (mission_id, json.dumps(payload, ensure_ascii=False),
+                (mission_id, json.dumps(merged, ensure_ascii=False),
                  now_iso()))
             self._conn.commit()
+
+    # Terminal states that must never be overwritten by a different state.
+    _MISSION_TERMINAL = frozenset({"MISSION_DONE", "HUMAN", "FAILED"})
+
+    def record_mission_state_atomic(self, mission_id: str, state: str,
+                                    payload: Dict) -> bool:
+        """Atomically record a state transition ONLY if the mission is not
+        already in a terminal state (or is already in ``state``).
+
+        Closes the check-then-act window in MissionController._set_state: the
+        terminal-state check and the write happen under one store lock, so a
+        mission thread writing MISSION_DONE and a panel thread writing HUMAN
+        cannot both pass the check and have the loser clobber the winner. The
+        first terminal write wins; later different-state writes are dropped.
+
+        Returns True if the write landed, False if suppressed (already
+        terminal with a different state).
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT payload_json FROM missions WHERE mission_id=?",
+                (mission_id,))
+            row = cur.fetchone()
+            merged: Dict = {}
+            if row:
+                try:
+                    merged = json.loads(row[0])
+                except (ValueError, TypeError):
+                    merged = {}
+            cur_state = merged.get("state")
+            if cur_state in self._MISSION_TERMINAL and cur_state != state:
+                return False
+            merged.update(payload)
+            merged["state"] = state
+            self._conn.execute(
+                "INSERT OR REPLACE INTO missions(mission_id,payload_json,recorded_at)"
+                " VALUES(?,?,?)",
+                (mission_id, json.dumps(merged, ensure_ascii=False),
+                 now_iso()))
+            self._conn.commit()
+            return True
 
     # ------------------------------------------------------- planner actions
     def action_seen(self, action_id: str) -> bool:
