@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SupervisionAlert",
+  "description": "Alert emitted by the observer when a deterministic supervision rule fires.",
+  "type": "object",
+  "required": [
+    "alert_id",
+    "alert_type",
+    "project_id",
+    "worker_id",
+    "detected_at",
+    "description",
+    "evidence"
+  ],
+  "properties": {
+    "alert_id": {
+      "type": "string",
+      "description": "Globally unique alert id."
+    },
+    "alert_type": {
+      "type": "string",
+      "enum": ["REPEATED_ERROR", "NO_PROGRESS"]
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "worker_id": {
+      "type": ["string", "null"]
+    },
+    "detected_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 time the rule fired."
+    },
+    "description": {
+      "type": "string"
+    },
+    "window_seconds": {
+      "type": ["integer", "null"],
+      "description": "Evaluation window in seconds (from config)."
+    },
+    "error_fingerprint": {
+      "type": ["string", "null"],
+      "description": "REPEATED_ERROR: fingerprint that repeated."
+    },
+    "error_count": {
+      "type": ["integer", "null"],
+      "description": "REPEATED_ERROR: number of occurrences in the window."
+    },
+    "activity_count": {
+      "type": ["integer", "null"],
+      "description": "NO_PROGRESS: activity events in the window."
+    },
+    "progress_count": {
+      "type": ["integer", "null"],
+      "description": "NO_PROGRESS: progress events in the window (0 when fired)."
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Sample messages / ids supporting the alert.",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

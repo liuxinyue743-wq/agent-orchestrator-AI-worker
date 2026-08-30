@@ -1,0 +1,15 @@
+# runtime state — per-mission SQLite DBs, logs, sidecars
+runtime/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# panel mission archives (auto-generated per run)
+tasks/mission-panel-*.json

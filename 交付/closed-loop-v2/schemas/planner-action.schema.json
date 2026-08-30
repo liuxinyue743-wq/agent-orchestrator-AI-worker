@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlannerAction",
+  "type": "object",
+  "required": ["action_id", "task_id", "action", "reason"],
+  "properties": {
+    "action_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "action": {
+      "type": "string",
+      "enum": ["CONTINUE", "SEND_LOCAL_FIX", "REPLAN_SPAWN",
+               "CANDIDATE_DONE", "HUMAN"]
+    },
+    "target_session_id": {"type": ["string", "null"]},
+    "message": {"type": "string"},
+    "replacement_task_spec": {"type": ["object", "null"]},
+    "reason": {"type": "string"},
+    "plan": {"type": "string"}
+  },
+  "additionalProperties": true
+}

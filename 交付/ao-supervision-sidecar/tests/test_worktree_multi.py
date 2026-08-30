@@ -1,0 +1,133 @@
+"""Multi-worker worktree plumbing tests (temp git repos, no network/AO).
+
+Covers the two properties that make N parallel workers safe:
+1. per-scope base isolation — two workers on the same task freeze against
+   their OWN worktree HEADs; one worker's edits never leak into the other's
+   path-gate/diff;
+2. sidecar commit + integration merge — clean merge of disjoint edits,
+   deterministic conflict detection.
+"""
+import subprocess
+from pathlib import Path
+
+from src import worktree as wt
+from src.state_store import StateStore
+
+
+def _run(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _run(path, "init", "-q")
+    _run(path, "config", "user.name", "t")
+    _run(path, "config", "user.email", "t@t")
+    (path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _run(path, "add", "-A")
+    _run(path, "commit", "-q", "-m", "init")
+    return path
+
+
+def _add_worktree(repo: Path, name: str) -> Path:
+    out = Path(str(repo) + "-" + name)
+    _run(repo, "worktree", "add", "-q", "-b", name, str(out))
+    return out
+
+
+def test_two_workers_freeze_isolated_bases(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    w1 = _add_worktree(repo, "w1")
+    w2 = _add_worktree(repo, "w2")
+    # worker 1 commits an edit; worker 2 stays at base
+    (w1 / "app.py").write_text("x = 2\n", encoding="utf-8")
+    _run(w1, "commit", "-q", "-am", "w1 edit")
+    store = StateStore(tmp_path / "s.db")
+    b1 = wt.freeze_base(w1, store, "TASK-1", scope="worker-1")
+    b2 = wt.freeze_base(w2, store, "TASK-1", scope="worker-2")
+    # each froze ITS OWN head (w1 froze after its commit -> its changes are
+    # INVISIBLE to its own gate; w2 froze the original). Different scopes ->
+    # different sidecars, no cross-talk.
+    assert b1 and b2
+    head1 = wt._current_head(w1)
+    head2 = wt._current_head(w2)
+    assert b1 == head1 and b2 == head2
+    # w2's changed paths vs ITS base: nothing
+    assert wt.changed_paths(w2, b2) == []
+    # w1 vs its base: nothing either (its edit predates its freeze) — the
+    # point is neither sees the OTHER's tree
+    assert wt.changed_paths(w1, b1) == []
+
+
+def test_path_gate_scoped_per_worker(tmp_path):
+    """One worker edits tests/ — only THAT worker's path gate trips."""
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "t.py").write_text("def test_x(): pass\n",
+                                         encoding="utf-8")
+    _run(repo, "add", "-A")
+    _run(repo, "commit", "-q", "-m", "tests")
+    w_good = _add_worktree(repo, "good")
+    w_bad = _add_worktree(repo, "bad")
+    (w_good / "app.py").write_text("x = 2\n", encoding="utf-8")
+    (w_bad / "tests" / "t.py").write_text("def test_x(): assert False\n",
+                                          encoding="utf-8")
+    store = StateStore(tmp_path / "s.db")
+    bg = wt.freeze_base(w_good, store, "TASK-9", scope="good")
+    bb = wt.freeze_base(w_bad, store, "TASK-9", scope="bad")
+    forbidden, outside = wt.path_violations(
+        w_good, bg, allowed_paths=["app.py"], forbidden_paths=["tests/**"])
+    assert forbidden == [] and outside == []
+    forbidden2, outside2 = wt.path_violations(
+        w_bad, bb, allowed_paths=["app.py"], forbidden_paths=["tests/**"])
+    assert forbidden2 == ["tests/t.py"]
+
+
+def test_commit_all_and_clean_merge(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    w1 = _add_worktree(repo, "w1")
+    w2 = _add_worktree(repo, "w2")
+    # disjoint edits: w1 touches app.py, w2 creates new file
+    (w1 / "app.py").write_text("x = 2\n", encoding="utf-8")
+    (w2 / "newmod.py").write_text("y = 3\n", encoding="utf-8")
+    store = StateStore(tmp_path / "s.db")
+    wt.freeze_base(w1, store, "T", scope="w1")
+    wt.freeze_base(w2, store, "T", scope="w2")
+    integ = tmp_path / "integration"
+    assert wt.add_integration_worktree(str(repo), "integration", str(integ))
+    sha1 = wt.commit_all(w1, "subtask w1")
+    sha2 = wt.commit_all(w2, "subtask w2")
+    assert sha1 and sha2
+    r1 = wt.merge_worktree(str(integ), str(w1))
+    assert r1.status == wt.MergeOutcome.OK, r1.detail
+    r2 = wt.merge_worktree(str(integ), str(w2))
+    assert r2.status == wt.MergeOutcome.OK, r2.detail
+    # both edits present on the integration branch
+    assert (integ / "app.py").read_text(encoding="utf-8") == "x = 2\n"
+    assert (integ / "newmod.py").read_text(encoding="utf-8") == "y = 3\n"
+
+
+def test_merge_conflict_detected(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    w1 = _add_worktree(repo, "w1")
+    w2 = _add_worktree(repo, "w2")
+    (w1 / "app.py").write_text("x = 100\n", encoding="utf-8")
+    (w2 / "app.py").write_text("x = 200\n", encoding="utf-8")
+    wt.commit_all(w1, "c1")
+    integ = tmp_path / "integration"
+    wt.add_integration_worktree(str(repo), "integration", str(integ))
+    r1 = wt.merge_worktree(str(integ), str(w1))
+    assert r1.status == wt.MergeOutcome.OK
+    wt.commit_all(w2, "c2")
+    r2 = wt.merge_worktree(str(integ), str(w2))
+    assert r2.status == wt.MergeOutcome.CONFLICT
+    # merge was aborted: tree still has w1's value, no conflict markers
+    assert (integ / "app.py").read_text(encoding="utf-8") == "x = 100\n"
+    assert "<<<<<<<" not in (integ / "app.py").read_text(encoding="utf-8")
+
+
+def test_commit_all_no_changes_returns_head(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    head = wt._current_head(repo)
+    assert wt.commit_all(repo, "noop") == head

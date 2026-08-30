@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskSpec",
+  "type": "object",
+  "required": ["task_id", "project_id", "objective", "allowed_paths",
+               "forbidden_paths", "acceptance_criteria", "gate_commands",
+               "budgets"],
+  "properties": {
+    "task_id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "objective": {"type": "string"},
+    "worker_session_id": {"type": ["string", "null"]},
+    "allowed_paths": {"type": "array", "items": {"type": "string"}},
+    "forbidden_paths": {"type": "array", "items": {"type": "string"}},
+    "dependencies": {"type": "array", "items": {"type": "string"}},
+    "worker_harness": {"type": "string", "default": "claude-code"},
+    "acceptance_criteria": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "properties": {
+          "id": {"type": "string"},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "required_evidence": {"type": "array", "items": {"type": "string"}},
+    "gate_commands": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "budgets": {
+      "type": "object",
+      "required": ["max_local_fixes", "max_replans", "max_same_alerts",
+                   "max_runtime_seconds"],
+      "properties": {
+        "max_local_fixes": {"type": "integer", "minimum": 0},
+        "max_replans": {"type": "integer", "minimum": 0},
+        "max_same_alerts": {"type": "integer", "minimum": 0},
+        "max_runtime_seconds": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "additionalProperties": true
+}
