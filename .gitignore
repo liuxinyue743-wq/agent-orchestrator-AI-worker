@@ -1,0 +1,31 @@
+# runtime state — per-mission SQLite DBs, logs, sidecars
+runtime/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# panel mission archives (auto-generated per run)
+tasks/mission-panel-*.json
+
+# panel runtime log
+panel/panel_run.log
+
+# postgres 存储后端配置：含明文 DSN/密码，绝不入库
+config/storage.json
+
+# legacy 死代码产物（不应再出现）
+src/runtime/
+
+# local distribution/download artifacts
+downloads/
+dist/
+ao-app/
+ao-data/
+*.exe

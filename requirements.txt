@@ -1,0 +1,7 @@
+# closed-loop-v2 运行依赖
+pyyaml>=6.0        # 读取 config/default.yaml
+jsonschema>=4.0    # mission_contracts 契约校验（缺失则退化为弱校验，不推荐）
+pytest>=8.0        # 离线自检 + 门禁命令默认用 pytest
+
+# 可选：PostgreSQL 存储后端（默认 SQLite 零配置）。如需 pg 后端，取消下行注释：
+# psycopg[binary]>=3.1
