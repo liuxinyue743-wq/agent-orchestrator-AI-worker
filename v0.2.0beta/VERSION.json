@@ -1,0 +1,11 @@
+{
+  "product_name": "CL_AO",
+  "version": "0.2.1-rc1",
+  "base_repository": "zhaoshiyi4246/agent-orchestrator-AI-worker",
+  "base_commit": "4d3e8e6b5e70bab868b2eef0d28c7742dea044ba",
+  "original_release_sha256": "73397cb066f6991681dc8404b1a85c10e80b1169a8a85b278b88ee7bdf035986",
+  "status": "LOCAL_WINDOWS_VALIDATION_REQUIRED",
+  "ao_baseline": "0.12.9",
+  "worker_provider_changed": false,
+  "note": "The original release live results do not certify this modified candidate."
+}

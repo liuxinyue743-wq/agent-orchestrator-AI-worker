@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>CL_AO · Closed-Loop Agent Orchestrator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --border:#2d333b; --text:#e6edf3;
+    --dim:#8b949e; --accent:#58a6ff; --green:#3fb950; --red:#f85149;
+    --amber:#d29922; --purple:#bc8cff;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 "Microsoft YaHei",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px;
+           background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:16px; font-weight:600; }
+  .badge { padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600;
+           background:#21262d; border:1px solid var(--border); }
+  .badge.RUNNING, .badge.MISSION_READY { color:var(--accent); border-color:var(--accent); }
+  .badge.MISSION_DONE, .badge.DONE { color:var(--green); border-color:var(--green); }
+  .badge.HUMAN, .badge.FAILED { color:var(--red); border-color:var(--red); }
+  .badge.WORKER_RUNNING, .badge.WORKER_RETRYING { color:var(--amber); border-color:var(--amber); }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); display:inline-block; }
+  .dot.on { background:var(--green); animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  button { background:#21262d; color:var(--text); border:1px solid var(--border);
+           border-radius:6px; padding:6px 14px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  button.danger { border-color:var(--red); color:var(--red); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input, textarea, select { background:#0d1117; color:var(--text); border:1px solid var(--border);
+           border-radius:6px; padding:6px 8px; font:13px inherit; width:100%; }
+  input:focus, textarea:focus, select:focus { outline:none; border-color:var(--accent); }
+  label { font-size:12px; color:var(--dim); display:block; margin:6px 0 2px; }
+  .grid { display:grid; grid-template-columns:300px 1fr 380px; gap:10px; padding:10px 16px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; }
+  .card h3 { font-size:13px; color:var(--dim); margin-bottom:8px; font-weight:600; }
+  #newMission { display:none; margin:10px 16px 0; }
+  #newMission.open { display:block; }
+  .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 16px; }
+  .subtask { border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin-bottom:8px; }
+  .subtask .tid { font-size:12px; color:var(--dim); }
+  .subtask .obj { font-size:12px; margin:4px 0; color:var(--text); }
+  .bar { height:5px; background:#21262d; border-radius:3px; overflow:hidden; margin-top:3px; }
+  .bar > div { height:100%; background:var(--amber); }
+  .topology-wrap { text-align:center; }
+  svg { width:100%; height:auto; min-height:340px; }
+  .node circle, .node rect { transition:all .3s; }
+  .node text { fill:var(--text); font-size:12px; }
+  .node .sub { fill:var(--dim); font-size:10px; }
+  .node.active circle, .node.active rect { stroke:var(--green); stroke-width:3; filter:drop-shadow(0 0 6px var(--green)); }
+  .edge { stroke:#3d444d; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+  .edge.control { stroke:var(--accent); }
+  .edge.evidence { stroke:var(--purple); stroke-dasharray:5 3; }
+  .edge.projection { stroke:var(--dim); stroke-dasharray:2 4; }
+  .edge.both { marker-start:url(#arr); }
+  .edge.live { stroke:var(--green); stroke-width:2.5; }
+  .edge-label { fill:var(--dim); font-size:9px; }
+  .knobs { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:10px; }
+  .knobs input { text-align:center; }
+  .tabs { display:flex; gap:4px; margin-bottom:8px; }
+  .tabs button { border-radius:6px 6px 0 0; border-bottom:none; padding:5px 12px; font-size:12px; }
+  .tabs button.on { background:#21262d; color:var(--accent); }
+  .tabpage { display:none; height:430px; overflow-y:auto; font-size:12px; }
+  .tabpage.on { display:block; }
+  .tabpage pre { white-space:pre-wrap; word-break:break-all; font:12px/1.6 Consolas,monospace; color:var(--text); }
+  .ev { border-bottom:1px solid #21262d; padding:4px 0; }
+  .ev .t { color:var(--dim); font-size:11px; }
+  .ev .actor { color:var(--purple); }
+  .verdict-PASS { color:var(--green); } .verdict-FAIL { color:var(--red); }
+  #directiveBar { display:flex; gap:8px; padding:10px 16px; background:var(--panel);
+                  border-top:1px solid var(--border); align-items:center; }
+  #directiveBar select { width:210px; }
+  #directiveBar .hint { font-size:11px; color:var(--dim); white-space:nowrap; }
+  #toast { position:fixed; right:16px; bottom:70px; background:#1f6feb; color:#fff;
+           padding:8px 16px; border-radius:8px; display:none; z-index:9; }
+  .missions-list { max-height:180px; overflow-y:auto; }
+  .missions-list .mrow { display:flex; justify-content:space-between; align-items:center;
+           padding:4px 6px; border-bottom:1px solid #21262d; font-size:12px; }
+  .mrow button { padding:2px 8px; font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌀 CL_AO · Closed-Loop Agent Orchestrator</h1>
+  <span class="dot" id="runDot"></span>
+  <span class="badge" id="missionState">空闲</span>
+  <span id="elapsed" style="color:var(--dim);font-size:12px"></span>
+  <span style="flex:1"></span>
+  <button id="btnNew">＋ 新建任务</button>
+  <button id="btnStop" class="danger" disabled>■ 停止</button>
+</header>
+
+<div id="newMission" class="card">
+  <h3>新建 Mission（一键启动闭环任务）</h3>
+  <label>AO Project *</label>
+  <div style="display:flex;gap:8px">
+    <select id="f_project" disabled><option>正在加载 AO Projects…</option></select>
+    <button id="btnProjects" type="button">刷新项目</button>
+  </div>
+  <div id="f_project_meta" style="font-size:12px;color:var(--dim);margin-top:5px">Project path：— · kind：—</div>
+  <div id="f_project_error" style="font-size:12px;color:var(--red);margin-top:3px"></div>
+  <label>任务目标 *</label>
+  <textarea id="f_obj" rows="2" placeholder="例：在 app.py 新增 power(a,n) 返回 a 的 n 次方，配 pytest 测试"></textarea>
+  <div class="form-grid">
+    <div>
+      <label>验收条件（每行一条）*</label>
+      <textarea id="f_ac" rows="3" placeholder="power(2,3)==8&#10;power(5,0)==1"></textarea>
+      <label>门禁命令（每行一条）</label>
+      <input id="f_gate" value="python -m pytest -q">
+    </div>
+    <div>
+      <label>允许路径（每行一条）</label>
+      <textarea id="f_paths" rows="3">app.py
+math2.py
+tests/**</textarea>
+      <label>最大子任务数 / 给 Planner 的总体指令</label>
+      <div style="display:flex;gap:8px">
+        <input id="f_sub" type="number" min="1" max="2" value="1" style="width:70px">
+        <input id="f_instr" placeholder="测试全绿即完成；禁止改 tests/">
+      </div>
+    </div>
+  </div>
+  <div style="margin-top:10px;text-align:right">
+    <button class="primary" id="btnStart" disabled>▶ 启动闭环</button>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- 左：任务与子任务 -->
+  <div>
+    <div class="card">
+      <h3>历史任务（可续跑/查看）</h3>
+      <div class="missions-list" id="missionsList"><span style="color:var(--dim)">无</span></div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <h3>子任务状态机</h3>
+      <div id="subtasks"><span style="color:var(--dim)">尚未加载任务</span></div>
+    </div>
+  </div>
+
+  <!-- 中：拓扑 + 时间参数 + 证据 -->
+  <div>
+    <div class="card topology-wrap">
+      <h3>控制与证据流（实线=控制/读写，虚线=证据/派生投影）</h3>
+      <svg id="topo" viewBox="0 0 760 470" width="760" height="470">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                  markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#3d444d"/>
+          </marker>
+        </defs>
+        <!-- current physical control and evidence flow -->
+        <line class="edge control" x1="380" y1="50" x2="380" y2="76"></line>
+        <line class="edge control" x1="305" y1="108" x2="234" y2="151"></line>
+        <line class="edge control" x1="210" y1="194" x2="210" y2="370"></line>
+        <path class="edge control" d="M300,405 C350,345 345,180 365,124"></path>
+        <line class="edge evidence" x1="82" y1="348" x2="113" y2="272"></line>
+        <line class="edge evidence" x1="143" y1="232" x2="191" y2="187"></line>
+        <line class="edge evidence" x1="542" y1="151" x2="455" y2="110"></line>
+        <path class="edge evidence" d="M548,181 C430,235 265,242 148,252"></path>
+        <path class="edge evidence" d="M618,241 C575,155 500,112 455,105"></path>
+        <path class="edge evidence" d="M612,270 C480,295 305,235 235,186"></path>
+        <line class="edge control both" x1="380" y1="124" x2="380" y2="210"></line>
+        <path class="edge control both" d="M430,118 C485,190 470,305 410,330"></path>
+        <path class="edge projection" d="M440,238 C520,265 565,330 600,375"></path>
+        <text class="edge-label" x="388" y="67">Mission</text>
+        <text class="edge-label" x="250" y="125">规划</text>
+        <text class="edge-label" x="217" y="300">自动指令</text>
+        <text class="edge-label" x="282" y="342">状态/证据</text>
+        <text class="edge-label" x="56" y="304">触发</text>
+        <text class="edge-label" x="150" y="218">审计结果</text>
+        <text class="edge-label" x="455" y="205">Gate 证据</text>
+        <text class="edge-label" x="520" y="232">复核结果</text>
+        <text class="edge-label" x="390" y="174">运行状态</text>
+        <text class="edge-label" x="482" y="315">AO REST/CLI</text>
+        <text class="edge-label" x="515" y="318">派生</text>
+        <!-- nodes -->
+        <g class="node" id="n-user"><circle cx="380" cy="30" r="20" fill="#1f6feb"/><text x="380" y="34" text-anchor="middle" fill="#fff">User</text></g>
+        <g class="node" id="n-controller"><rect x="305" y="76" width="150" height="48" rx="12" fill="#6e40c9"/><text x="380" y="96" text-anchor="middle" fill="#fff">MissionController</text><text class="sub" x="380" y="113" text-anchor="middle">唯一控制平面</text></g>
+        <g class="node" id="n-planner"><circle cx="210" cy="170" r="24" fill="#6e40c9"/><text x="210" y="174" text-anchor="middle" fill="#fff">Planner</text></g>
+        <g class="node" id="n-observer"><circle cx="65" cy="368" r="22" fill="#8957e5"/><text x="65" y="372" text-anchor="middle" fill="#fff">Observer</text><text class="sub" x="65" y="400" text-anchor="middle">确定性程序</text></g>
+        <g class="node" id="n-auditor"><circle cx="125" cy="252" r="22" fill="#9e6a03"/><text x="125" y="256" text-anchor="middle" fill="#fff">Auditor</text><text class="sub" x="125" y="282" text-anchor="middle">只读审计</text></g>
+        <g class="node" id="n-verifier"><circle cx="635" cy="262" r="24" fill="#1a7f37"/><text x="635" y="266" text-anchor="middle" fill="#fff">Verifier</text><text class="sub" x="635" y="294" text-anchor="middle">独立复核</text></g>
+        <g class="node" id="n-gate"><circle cx="565" cy="165" r="22" fill="#0b6e7a"/><text x="565" y="169" text-anchor="middle" fill="#fff">Gate</text><text class="sub" x="565" y="193" text-anchor="middle">确定性程序</text></g>
+        <g class="node" id="n-store"><rect x="320" y="210" width="120" height="50" rx="10" fill="#1f6feb"/><text x="380" y="232" text-anchor="middle" fill="#fff">StateStore</text><text class="sub" x="380" y="249" text-anchor="middle">唯一 CL_AO 状态源</text></g>
+        <g class="node" id="n-ao"><rect x="320" y="330" width="120" height="50" rx="10" fill="#b54708"/><text x="380" y="352" text-anchor="middle" fill="#fff">AO</text><text class="sub" x="380" y="369" text-anchor="middle">Session / worktree</text></g>
+        <g class="node" id="n-timeline"><rect x="540" y="375" width="180" height="48" rx="10" fill="#30363d"/><text x="630" y="397" text-anchor="middle">Event Projection</text><text class="sub" x="630" y="414" text-anchor="middle">Timeline / JSONL / Markdown</text></g>
+        <g class="node" id="n-worker-lane"><rect x="120" y="370" width="180" height="82" rx="12" fill="#21262d" stroke="#b54708"/><text class="sub" x="210" y="388" text-anchor="middle">Worker 1..N · AO Codex</text></g>
+        <g id="workers"></g>
+      </svg>
+      <div id="lastAction" style="font-size:12px;color:var(--dim)">—</div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <h3>时间参数（秒，实时生效）</h3>
+      <div class="knobs">
+        <div><label>Observer 轮询</label><input id="k_poll" type="number" min="1"></div>
+        <div><label>Auditor 冷却</label><input id="k_idle" type="number" min="1"></div>
+        <div><label>审批卡死升级</label><input id="k_block" type="number" min="1"></div>
+        <div><label>L0 宽限</label><input id="k_grace" type="number" min="1"></div>
+      </div>
+      <div style="margin-top:8px;text-align:right">
+        <button id="btnCfg">应用</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <h3>最近证据（Gate / Verifier）</h3>
+      <div id="evidence" style="font-size:12px">—</div>
+    </div>
+  </div>
+
+  <!-- 右：信息流 -->
+  <div class="card">
+    <div class="tabs">
+      <button class="on" data-tab="ev">事件流</button>
+      <button data-tab="mem">memory.md</button>
+      <button data-tab="proj">project.md</button>
+      <button data-tab="al">告警</button>
+    </div>
+    <div class="tabpage on" id="tab-ev"></div>
+    <div class="tabpage" id="tab-mem"><pre id="memPre">—</pre></div>
+    <div class="tabpage" id="tab-proj"><pre id="projPre">—</pre></div>
+    <div class="tabpage" id="tab-al"></div>
+  </div>
+</div>
+
+<div id="directiveBar">
+  ✉ 指令：
+  <select id="d_target">
+    <option value="planner">Planner（仅其可见）</option>
+    <option value="auditor">Auditor（同步 Planner）</option>
+    <option value="verifier">Verifier（同步 Planner）</option>
+    <option value="observer">Observer（同步 Planner）</option>
+    <option value="gate">Gate（同步 Planner）</option>
+  </select>
+  <input id="d_text" placeholder="对所选 agent 下达指令…（发给非 Planner 的指令会自动同步 Planner）">
+  <button class="primary" id="btnSend">发送</button>
+  <span class="hint" id="d_hint"></span>
+</div>
+<div id="toast"></div>
+
+<script>
+let LAST = null, ACTIVE_TAB = "ev", PROJECTS = [];
+const $ = id => document.getElementById(id);
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="block";
+  setTimeout(()=>t.style.display="none", 2600); }
+
+/* ---------------- tabs ---------------- */
+document.querySelectorAll(".tabs button").forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on"); ACTIVE_TAB=b.dataset.tab;
+    document.querySelectorAll(".tabpage").forEach(p=>p.classList.remove("on"));
+    $("tab-"+ACTIVE_TAB).classList.add("on");
+    if(ACTIVE_TAB==="mem"||ACTIVE_TAB==="proj") loadFile(ACTIVE_TAB==="mem"?"memory.md":"project.md");
+  };
+});
+
+function loadFile(name){
+  fetch("/api/file?name="+name).then(r=>r.json()).then(d=>{
+    $(name==="memory.md"?"memPre":"projPre").textContent = d.content || d.error || "—";
+  });
+}
+
+/* ---------------- render ---------------- */
+function render(s){
+  LAST = s;
+  const m = s.mission;
+  const st = m ? m.state : "空闲";
+  $("missionState").textContent = m ? (m.id + " · " + st) : "空闲（新建或查看历史任务）";
+  $("missionState").className = "badge " + st;
+  $("runDot").className = "dot" + (s.running ? " on" : "");
+  $("elapsed").textContent = s.elapsed!=null ? ("已运行 " + s.elapsed + "s") : "";
+  $("btnStop").disabled = !s.running;
+
+  // knobs
+  if(document.activeElement!==$("k_poll")) $("k_poll").value = s.config.poll_seconds;
+  if(document.activeElement!==$("k_idle")) $("k_idle").value = s.config.idle_audit_cooldown_seconds;
+  if(document.activeElement!==$("k_block")) $("k_block").value = s.config.blocked_escalation_seconds;
+  if(document.activeElement!==$("k_grace")) $("k_grace").value = s.config.l0_nudge_grace_seconds;
+
+  // missions list
+  const ml = $("missionsList");
+  if(s.missions && s.missions.length){
+    ml.innerHTML = s.missions.slice(0,12).map(x=>{
+      const terminal = ["MISSION_DONE","HUMAN","FAILED"].includes(x.state);
+      const cur = m && m.id===x.mission_id;
+      return `<div class="mrow"><span title="${esc(x.objective)}">${esc(x.mission_id)}
+        <span class="badge ${x.state}" style="font-size:10px">${x.state}</span></span>
+        <span>${cur?"<em style='color:var(--accent)'>当前</em>":
+          (terminal?"":"<button data-resume='"+esc(x.mission_id)+"'>续跑</button>")}
+          <button data-attach='"+esc(x.mission_id)+"'>查看</button></span></div>`;
+    }).join("");
+    ml.querySelectorAll("[data-resume]").forEach(b=>b.onclick=()=>resume(b.dataset.resume));
+    ml.querySelectorAll("[data-attach]").forEach(b=>b.onclick=()=>attach(b.dataset.attach));
+  }
+
+  // subtasks
+  const subs = s.subtasks || [];
+  $("subtasks").innerHTML = subs.length ? subs.map(t=>{
+    const pct = (t.max_local_fixes>0)? Math.min(100, 100*t.local_fixes/t.max_local_fixes):0;
+    return `<div class="subtask">
+      <div class="tid">${esc(t.task_id)} ${t.worker_session_id?("· "+esc(t.worker_session_id)):""}</div>
+      <span class="badge ${t.state}">${t.state}</span>
+      <div class="obj">${esc(t.objective)}</div>
+      <div class="tid">LOCAL_FIX ${t.local_fixes}/${t.max_local_fixes} · REPLAN ${t.replans}/${t.max_replans}</div>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+    </div>`;
+  }).join("") : "<span style='color:var(--dim)'>该任务尚未拆解子任务</span>";
+
+  // worker nodes in topology
+  const wg = $("workers");
+  const workers = subs.filter(t=>t.worker_session_id);
+  wg.innerHTML = workers.map((t,i)=>{
+    const x = workers.length===1 ? 210 : 145 + i*(130/(workers.length-1)), y = 416;
+    const active = ["WORKER_RUNNING","WORKER_RETRYING"].includes(t.state) ? " active" : "";
+    return `<g class="node${active}" id="n-w${i}">
+      <circle cx="${x}" cy="${y}" r="18" fill="#b54708"/>
+      <text x="${x}" y="${y+4}" text-anchor="middle" fill="#fff">W${i+1}</text>
+      <text class="sub" x="${x}" y="${y+31}" text-anchor="middle">${esc(t.state)}</text></g>`;
+  }).join("");
+  // directive targets: refresh workers
+  const sel = $("d_target"), cur = sel.value;
+  sel.querySelectorAll("option[data-w]").forEach(o=>o.remove());
+  workers.forEach((t,i)=>{
+    const o = document.createElement("option");
+    o.value = "worker:"+t.worker_session_id; o.dataset.w = "1";
+    o.textContent = `Worker ${i+1} (${t.worker_session_id.slice(-8)})（同步 Planner）`;
+    sel.appendChild(o);
+  });
+  sel.value = cur;
+
+  // node/edge activity from latest transition
+  document.querySelectorAll(".node").forEach(n=>n.classList.remove("active"));
+  const lt = (s.transitions||[])[0];
+  if(lt){
+    const map = {observer:"n-observer", auditor:"n-auditor", planner:"n-planner",
+                 verifier:"n-verifier", integration_gate:"n-gate", closed_loop:"n-controller",
+                 executor:"n-controller", user:"n-user"};
+    const id = map[lt.actor]; if(id) $(id)?.classList.add("active");
+    $("lastAction").textContent = `最近：${lt.task} → ${lt.to}（${lt.actor}：${lt.reason}）`;
+  }
+
+  // evidence
+  const g = (s.gate_runs||[])[0], v = (s.verifications||[])[0];
+  let ev = "";
+  if(g) ev += `<div>Gate <code>${esc(g.command||"")}</code> exit=${g.exit_code}
+    <span style="color:${g.exit_code===0?"var(--green)":"var(--red)"}">${g.exit_code===0?"✔":"✘"}</span></div>`;
+  if(v) ev += `<div>Verifier <b class="verdict-${esc(v.verdict)}">${esc(v.verdict)}</b> — ${esc((v.summary||"").slice(0,140))}</div>`;
+  $("evidence").innerHTML = ev || "—";
+
+  // events tab
+  const evs = [];
+  (s.transitions||[]).forEach(t=>evs.push({at:t.at, html:
+    `<span class="actor">${esc(t.actor)}</span> ${esc(t.task)} → <b>${esc(t.to)}</b> <span class="t">${esc(t.reason)}</span>`}));
+  (s.traffic||[]).slice(-8).forEach(t=>evs.push({at:t.at||"", html:
+    `<span class="actor">事件投影</span> ${esc(t.sender||"")}→${esc(t.receiver||"")} ${esc(t.kind||"")}`}));
+  $("tab-ev").innerHTML = evs.slice(0,30).map(e=>
+    `<div class="ev"><span class="t">${esc((e.at||"").slice(11,19))}</span> ${e.html}</div>`).join("") || "—";
+
+  // alerts tab
+  $("tab-al").innerHTML = (s.alerts||[]).map(a=>
+    `<div class="ev"><span class="t">${esc((a.detected_at||"").slice(0,19))}</span>
+     <b style="color:var(--amber)">${esc(a.alert_type||"")}</b> ${esc((a.description||"").slice(0,160))}</div>`).join("")
+     || "<span style='color:var(--dim)'>无告警</span>";
+
+  $("d_hint").textContent = s.mission ? "" : "（先启动或查看一个任务）";
+}
+
+/* ---------------- actions ---------------- */
+function showSelectedProject(){
+  const selected = PROJECTS.find(p=>String(p.id)===$("f_project").value);
+  $("f_project_meta").textContent = selected
+    ? `Project path：${selected.path || "—"} · kind：${selected.kind || "—"}`
+    : "Project path：— · kind：—";
+}
+function loadProjects(){
+  const selector=$("f_project"), error=$("f_project_error"), start=$("btnStart");
+  selector.disabled=true; start.disabled=true; error.textContent="";
+  selector.innerHTML="<option>正在加载 AO Projects…</option>";
+  return fetch("/api/projects").then(r=>r.json()).then(d=>{
+    if(!d.ok) throw new Error(d.error || "AO Project API 请求失败");
+    PROJECTS=d.projects || [];
+    selector.replaceChildren();
+    if(!PROJECTS.length){
+      const option=document.createElement("option");
+      option.textContent="AO 中没有已注册项目"; selector.appendChild(option);
+      error.textContent="AO 中没有已注册项目"; showSelectedProject(); return;
+    }
+    PROJECTS.forEach(p=>{
+      const option=document.createElement("option");
+      option.value=String(p.id); option.textContent=`${p.name} (${p.id})`;
+      selector.appendChild(option);
+    });
+    selector.disabled=false; start.disabled=false; showSelectedProject();
+  }).catch(e=>{
+    PROJECTS=[]; selector.replaceChildren();
+    const option=document.createElement("option"); option.textContent="AO Project 加载失败";
+    selector.appendChild(option); error.textContent=e.message; showSelectedProject();
+  });
+}
+$("f_project").onchange=showSelectedProject;
+$("btnProjects").onclick=loadProjects;
+$("btnNew").onclick = ()=>{
+  const opened=$("newMission").classList.toggle("open");
+  if(opened) loadProjects();
+};
+$("btnStop").onclick = ()=> fetch("/api/stop",{method:"POST"}).then(()=>toast("已请求停止（状态可续跑）"));
+$("btnCfg").onclick = ()=> fetch("/api/config",{method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({poll_seconds:+$("k_poll").value,
+    idle_audit_cooldown_seconds:+$("k_idle").value,
+    blocked_escalation_seconds:+$("k_block").value,
+    l0_nudge_grace_seconds:+$("k_grace").value})})
+  .then(()=>toast("时间参数已实时生效"));
+$("btnStart").onclick = ()=>{
+  const body = {project_id:$("f_project").value,
+    objective:$("f_obj").value, acceptance_criteria:$("f_ac").value,
+    allowed_paths:$("f_paths").value, gate_commands:$("f_gate").value,
+    max_subtasks:Number($("f_sub").value), user_instruction:$("f_instr").value};
+  fetch("/api/mission",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
+      if(d.ok){ toast("已启动 "+d.mission_id); $("newMission").classList.remove("open"); }
+      else toast("启动失败："+d.error);
+    });
+};
+$("btnSend").onclick = ()=>{
+  const t=$("d_target").value, x=$("d_text").value.trim();
+  if(!x) return;
+  fetch("/api/directive",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({target:t,text:x})}).then(r=>r.json()).then(d=>{
+      if(d.ok){ toast(d.directive.mirrored_to_planner ? "已发送，并同步 Planner" : "已发送（仅 Planner 可见）");
+        $("d_text").value=""; }
+      else toast("发送失败："+d.error);
+    });
+};
+$("d_text").addEventListener("keydown", e=>{ if(e.key==="Enter") $("btnSend").click(); });
+function resume(mid){ fetch("/api/resume",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({mission_id:mid})}).then(r=>r.json()).then(d=>
+    toast(d.ok?("已断点续跑 "+mid):("续跑失败："+d.error))); }
+function attach(mid){ fetch("/api/attach",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({mission_id:mid})}).then(r=>r.json()).then(d=>
+    toast(d.ok?("已加载 "+mid):("加载失败："+d.error))); }
+
+/* ---------------- live feed ---------------- */
+function connect(){
+  try{
+    const es = new EventSource("/api/stream");
+    es.onmessage = e => render(JSON.parse(e.data));
+    es.onerror = ()=>{ es.close(); setTimeout(connect, 4000); };
+  }catch(e){ setInterval(()=>fetch("/api/state").then(r=>r.json()).then(render), 4000); }
+}
+loadProjects();
+connect();
+setInterval(()=>{ if(ACTIVE_TAB==="mem"||ACTIVE_TAB==="proj")
+  loadFile(ACTIVE_TAB==="mem"?"memory.md":"project.md"); }, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "mission_id": "MISSION-E2E-SMOKE",
+  "project_id": "REPLACE_WITH_AO_PROJECT_ID",
+  "objective": "在 app.py 新增 clamp01_e2e(x)",
+  "allowed_paths": ["app.py"],
+  "forbidden_paths": [".git/**"],
+  "acceptance_criteria": [
+    {"id": "E2E-AC-01", "description": "clamp01_e2e(-1) == 0"},
+    {"id": "E2E-AC-02", "description": "clamp01_e2e(0.25) == 0.25"},
+    {"id": "E2E-AC-03", "description": "clamp01_e2e(2) == 1"}
+  ],
+  "gate_commands": ["python -c \"from app import clamp01_e2e; assert clamp01_e2e(-1)==0; assert clamp01_e2e(0.25)==0.25; assert clamp01_e2e(2)==1\""],
+  "worker_harness": "codex",
+  "budgets": {
+    "max_subtasks": 1
+  }
+}

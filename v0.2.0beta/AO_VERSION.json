@@ -1,0 +1,11 @@
+{
+  "name": "Agent Orchestrator",
+  "upstream_repository": "https://github.com/Untrivial-ai/agent-orchestrator",
+  "tested_version": "v0.12.9",
+  "windows_asset": "agent-orchestrator-win32-x64.exe",
+  "windows_download_url": "https://github.com/Untrivial-ai/agent-orchestrator/releases/download/v0.12.9/agent-orchestrator-win32-x64.exe",
+  "windows_size_bytes": 130460533,
+  "windows_sha256": "1584036ba62a0307063cb0ba03caa1745a6d5bb8fd2e449bcdcf789776d6b037",
+  "license": "Apache-2.0",
+  "notes": "CL_AO was developed and tested against v0.12.9. Upgrade only after compatibility testing."
+}
